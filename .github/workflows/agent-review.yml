@@ -16,6 +16,10 @@ concurrency:
 
 jobs:
   review:
+    # Self-hosted because the review LLM endpoint is only reachable from
+    # this network. Never run untrusted fork code on a self-hosted runner:
+    # fork PRs are excluded, and secrets are unavailable to them anyway.
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.fork == false
     runs-on: [self-hosted, axonhub-operator]
     timeout-minutes: 15
     permissions:

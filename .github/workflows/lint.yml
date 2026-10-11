@@ -7,7 +7,7 @@ on:
 jobs:
   lint:
     name: Run on Ubuntu
-    runs-on: [self-hosted, axonhub-operator]
+    runs-on: ubuntu-latest
     steps:
       - name: Reset workspace permissions
         # envtest and tool downloads leave read-only files that block
