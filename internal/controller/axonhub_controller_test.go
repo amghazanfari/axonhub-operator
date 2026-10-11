@@ -21,8 +21,11 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	appsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -77,8 +80,32 @@ var _ = Describe("AxonHub Controller", func() {
 				NamespacedName: typeNamespacedName,
 			})
 			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
+
+			By("Creating an owned Deployment matching the spec")
+			deployment := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+			Expect(deployment.Spec.Replicas).To(HaveValue(BeNumerically("==", 1)))
+			Expect(deployment.Spec.Template.Spec.Containers[0].Name).To(Equal("axonhub"))
+			Expect(deployment.Spec.Template.Spec.Containers[0].Image).To(Equal("looplj/axonhub:latest"))
+			Expect(deployment.OwnerReferences).To(HaveLen(1))
+			Expect(deployment.OwnerReferences[0].Kind).To(Equal("AxonHub"))
+
+			By("Reporting status with an observed generation and Ready condition")
+			Expect(k8sClient.Get(ctx, typeNamespacedName, axonhub)).To(Succeed())
+			Expect(axonhub.Status.ObservedGeneration).To(Equal(axonhub.Generation))
+			ready := meta.FindStatusCondition(axonhub.Status.Conditions, "Ready")
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Reason).To(Equal("DeploymentNotReady"))
+
+			By("Reconciling again to update the spec")
+			axonhub.Spec.Replicas = ptr.To(int32(3))
+			Expect(k8sClient.Update(ctx, axonhub)).To(Succeed())
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+			Expect(deployment.Spec.Replicas).To(HaveValue(BeNumerically("==", 3)))
 		})
 	})
 })
