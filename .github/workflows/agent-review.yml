@@ -1,0 +1,121 @@
+name: Agent PR Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to review"
+        required: true
+
+# One review per PR; a new push cancels the stale review
+concurrency:
+  group: agent-review-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: [self-hosted, axonhub-operator]
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+    steps:
+      - name: Resolve PR refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "BASE_SHA=$(gh pr view "$PR_NUMBER" --json baseRefOid --jq .baseRefOid)" >> "$GITHUB_ENV"
+          echo "HEAD_SHA=$(gh pr view "$PR_NUMBER" --json headRefOid --jq .headRefOid)" >> "$GITHUB_ENV"
+
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.HEAD_SHA }}
+          fetch-depth: 0
+
+      - name: Set up opencode project config
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL: ${{ vars.LLM_BASE_URL }}
+          LLM_MODEL: ${{ vars.LLM_MODEL }}
+        run: |
+          if [ -z "$LLM_BASE_URL" ] || [ -z "$LLM_MODEL" ]; then
+            echo "::error::repo variables LLM_BASE_URL and LLM_MODEL must be set"
+            exit 1
+          fi
+          mkdir -p .opencode
+          cat > .opencode/opencode.json <<EOF
+          {
+            "permission": {
+              "edit": { "*": "deny" },
+              "bash": {
+                "*": "deny",
+                "git diff*": "allow",
+                "git log*": "allow",
+                "git show*": "allow",
+                "cat *": "allow",
+                "grep *": "allow",
+                "find *": "allow",
+                "go doc*": "allow",
+                "wc *": "allow"
+              }
+            },
+            "providers": {
+              "llm": {
+                "name": "llm",
+                "package": "@ai-sdk/openai-compatible",
+                "settings": {
+                  "baseURL": "$LLM_BASE_URL",
+                  "apiKey": "__LLM_API_KEY__"
+                }
+              }
+            }
+          }
+          EOF
+          jq --arg key "$LLM_API_KEY" --arg model "$LLM_MODEL" \
+            '.providers.llm.settings.apiKey = $key
+             | .providers.llm.models[$model] = {name: "reviewer"}' \
+            .opencode/opencode.json > .opencode/opencode.json.tmp
+          mv .opencode/opencode.json.tmp .opencode/opencode.json
+
+      - name: Run agent review
+        env:
+          LLM_MODEL: ${{ vars.LLM_MODEL }}
+        run: |
+          if [ -z "$LLM_MODEL" ]; then
+            echo "::error::repo variable LLM_MODEL is not set"
+            exit 1
+          fi
+          PROMPT="$(git show origin/main:.github/agent/pr-review-prompt.md)"
+          if [ -z "$PROMPT" ]; then
+            echo "::error::review prompt is empty"
+            exit 1
+          fi
+          set +e
+          timeout 12m opencode run \
+            --model "llm/$LLM_MODEL" \
+            "$PROMPT" \
+            > /tmp/opencode/pr-review-$PR_NUMBER.out 2>&1
+          echo "exit=$?" >> /tmp/opencode/pr-review-$PR_NUMBER.out
+          test -s /tmp/opencode/pr-review-$PR_NUMBER.out
+
+      - name: Post review comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LLM_MODEL: ${{ vars.LLM_MODEL }}
+        run: |
+          {
+            echo "## 🤖 Agent Review"
+            echo ""
+            sed -E -e 's/\x1b\[[0-9;]*m//g' -e '/^[→>$] /d' -e '/Permission denied/d' -e '/^✗ /d' -e "s/$LLM_MODEL//g" \
+              /tmp/opencode/pr-review-$PR_NUMBER.out
+            echo ""
+            echo "---"
+            echo "*Triggered by \`${{ github.event_name }}\` • base \`${BASE_SHA:0:7}\` → head \`${HEAD_SHA:0:7}\`*"
+          } > /tmp/opencode/pr-review-comment-$PR_NUMBER.md
+          gh pr comment "$PR_NUMBER" --body-file /tmp/opencode/pr-review-comment-$PR_NUMBER.md
+          rm -f .opencode/opencode.json
