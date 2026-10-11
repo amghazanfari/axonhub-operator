@@ -1,0 +1,191 @@
+name: Docker Build & Release
+
+# Two release "states":
+#  1. Push to main            -> build and push the image tagged :latest
+#  2. Push to a branch named  -> build and push a versioned image and publish
+#     v<N>-<N>-<N>-release       a GitHub Release with notes about commit count
+#                                and first-time contributors.
+#
+# Concrete end-to-end example of the naming mapping:
+#   branch "v1-2-3-release" -> image ghcr.io/<owner>/<repo>:1.2.3 -> release tag "v1.2.3"
+on:
+  push:
+    branches:
+      - main
+      - "v[0-9]+-[0-9]+-[0-9]+-release"
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  # github.repository == <owner>/<repo>
+  IMAGE_NAME: ${{ github.repository }}
+
+# One pipeline per ref; a new push cancels the stale run. This also prevents
+# overlapping runs racing to create the same GitHub Release.
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-push:
+    name: Build and push Docker image
+    runs-on: ubuntu-latest
+    permissions:
+      # Least privilege: this job never writes repo contents.
+      contents: read
+      packages: write
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      is_release: ${{ steps.meta.outputs.is_release }}
+    steps:
+      - name: Reset workspace permissions
+        run: chmod -R u+w "$GITHUB_WORKSPACE" 2>/dev/null || true
+
+      - name: Clone the code
+        uses: actions/checkout@v4
+
+      - name: Resolve image tags
+        id: meta
+        run: |
+          set -euo pipefail
+          SHORT_SHA="${GITHUB_SHA::12}"
+          if [[ "${GITHUB_REF_NAME}" =~ ^v([0-9]+)-([0-9]+)-([0-9]+)-release$ ]]; then
+            VERSION="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+            echo "tags<<META_EOF" >> "$GITHUB_OUTPUT"
+            echo "${REGISTRY}/${IMAGE_NAME}:${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "${REGISTRY}/${IMAGE_NAME}:${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+            echo "META_EOF" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+            echo "tags<<META_EOF" >> "$GITHUB_OUTPUT"
+            echo "${REGISTRY}/${IMAGE_NAME}:latest" >> "$GITHUB_OUTPUT"
+            echo "${REGISTRY}/${IMAGE_NAME}:${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+            echo "META_EOF" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            org.opencontainers.image.title=${{ github.event.repository.name }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release-notes:
+    name: Publish release notes
+    needs: build-and-push
+    if: needs.build-and-push.outputs.is_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Reset workspace permissions
+        run: chmod -R u+w "$GITHUB_WORKSPACE" 2>/dev/null || true
+
+      - name: Clone the code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch main
+        # The merge-base fallback below needs origin/main to be present.
+        run: git fetch origin main
+
+      - name: Generate release notes
+        id: notes
+        env:
+          VERSION: ${{ needs.build-and-push.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          # Base point: the most recent previously released tag, falling back
+          # to the point where this release branch diverged from main. The
+          # current version's own tag is excluded so re-running this workflow
+          # after the release exists still computes the correct range.
+          BASE="$(git describe --abbrev=0 --tags --match 'v*' --exclude "v${VERSION}" "${GITHUB_SHA}^" 2>/dev/null || true)"
+          if [ -z "$BASE" ]; then
+            BASE="$(git merge-base origin/main "${GITHUB_SHA}")"
+          else
+            BASE="${BASE}^{commit}"
+          fi
+
+          COMMIT_COUNT="$(git rev-list --count "${BASE}..${GITHUB_SHA}")"
+
+          # First-time contributors: authors of the new commits that never
+          # authored a commit before the base point.
+          NEW_AUTHORS="$(mktemp)"
+          KNOWN_AUTHORS="$(mktemp)"
+          git log --format='%an <%ae>' "${BASE}..${GITHUB_SHA}" | sort -u > "${NEW_AUTHORS}"
+          git log --format='%an <%ae>' "${BASE}" | sort -u > "${KNOWN_AUTHORS}"
+          FIRST_TIMERS="$(comm -23 "${NEW_AUTHORS}" "${KNOWN_AUTHORS}")"
+
+          NOTES_FILE="$(mktemp)"
+          {
+            echo "## AxonHub Operator v${VERSION}"
+            echo
+            echo "This release contains **${COMMIT_COUNT} commit(s)** since the previous release."
+            echo
+            echo "### First-time contributors"
+            if [ -n "${FIRST_TIMERS}" ]; then
+              while IFS= read -r author; do
+                echo "- ${author}"
+              done <<< "${FIRST_TIMERS}"
+            else
+              echo "No new contributors in this release. Thank you to all our returning contributors!"
+            fi
+            echo
+            echo "### Changes"
+            echo
+            echo '```'
+            git log --oneline --no-decorate "${BASE}..${GITHUB_SHA}"
+            echo '```'
+          } > "${NOTES_FILE}"
+
+          # Publish the body via an output file artifact-style: store it in
+          # GITHUB_OUTPUT using a heredoc-free safe copy so commit messages
+          # (untrusted content) never need shell interpolation downstream.
+          {
+            echo "body<<NOTES_EOF"
+            cat "${NOTES_FILE}"
+            echo "NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create or update GitHub Release
+        env:
+          VERSION: ${{ needs.build-and-push.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+          # Passed through the environment (never interpolated into the script
+          # directly) because the body contains commit messages and author
+          # names, which are untrusted input.
+          RELEASE_NOTES: ${{ steps.notes.outputs.body }}
+        run: |
+          set -euo pipefail
+          if gh release view "v${VERSION}" >/dev/null 2>&1; then
+            gh release edit "v${VERSION}" \
+              --notes "${RELEASE_NOTES}" \
+              --latest
+          else
+            gh release create "v${VERSION}" \
+              --title "v${VERSION}" \
+              --notes "${RELEASE_NOTES}" \
+              --target "${GITHUB_SHA}" \
+              --latest
+          fi
