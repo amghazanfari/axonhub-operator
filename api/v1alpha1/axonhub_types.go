@@ -25,17 +25,27 @@ import (
 
 // AxonHubSpec defines the desired state of AxonHub.
 type AxonHubSpec struct {
-	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
+	// Replicas is the desired number of AxonHub pods.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:default=1
+	Replicas *int32 `json:"replicas,omitempty"`
 
-	// Foo is an example field of AxonHub. Edit axonhub_types.go to remove/update
-	Foo string `json:"foo,omitempty"`
+	// Image is the AxonHub container image (repository[:tag]).
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:default="looplj/axonhub:latest"
+	Image string `json:"image,omitempty"`
 }
 
 // AxonHubStatus defines the observed state of AxonHub.
 type AxonHubStatus struct {
-	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
+	// ObservedGeneration is the generation most recently observed by the controller.
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// ReadyReplicas is the number of pods of the managed Deployment reported ready.
+	ReadyReplicas int32 `json:"readyReplicas,omitempty"`
+
+	// Conditions represent the latest available observations of the resource's state.
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
 // +kubebuilder:object:root=true
