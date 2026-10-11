@@ -24,6 +24,11 @@ jobs:
     env:
       PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
     steps:
+      - name: Reset workspace permissions
+        # envtest and tool downloads leave read-only files that block
+        # the next run's checkout clean
+        run: chmod -R u+w "$GITHUB_WORKSPACE" 2>/dev/null || true
+
       - name: Resolve PR refs
         env:
           GH_TOKEN: ${{ github.token }}
