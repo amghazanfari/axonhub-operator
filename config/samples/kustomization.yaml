@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- axonhub_v1alpha1_axonhub.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples
