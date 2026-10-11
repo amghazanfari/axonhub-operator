@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -35,6 +36,9 @@ import (
 )
 
 const (
+	// axonhubContainerName is the name of the AxonHub container in the pod.
+	axonhubContainerName = "axonhub"
+
 	// axonhubContainerPort is the port AxonHub's HTTP server listens on.
 	axonhubContainerPort = 8090
 
@@ -56,7 +60,6 @@ type AxonHubReconciler struct {
 // +kubebuilder:rbac:groups=axonhub.onrender.com,resources=axonhubs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=axonhub.onrender.com,resources=axonhubs/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch
-// +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
 
 // Reconcile moves the cluster state closer to the state described by the
 // AxonHub custom resource.
@@ -79,7 +82,7 @@ func (r *AxonHubReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	if err := r.updateStatus(ctx, &axonhub, deployment); err != nil {
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("updating AxonHub status: %w", err)
 	}
 
 	return ctrl.Result{}, nil
@@ -87,6 +90,11 @@ func (r *AxonHubReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 // reconcileDeployment ensures a Deployment owned by the AxonHub resource
 // exists and matches the desired spec.
+//
+// The mutate callback only assigns fields the operator owns. The full
+// pod template is set on creation only; on updates just the desired
+// replicas and image are mutated so that API-server-defaulted fields are
+// preserved and steady-state reconciles are true no-ops.
 func (r *AxonHubReconciler) reconcileDeployment(ctx context.Context, axonhub *axonhubv1alpha1.AxonHub) (*appsv1.Deployment, error) {
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -95,37 +103,54 @@ func (r *AxonHubReconciler) reconcileDeployment(ctx context.Context, axonhub *ax
 		},
 	}
 
-	if err := ctrl.SetControllerReference(axonhub, deployment, r.Scheme); err != nil {
-		return nil, err
-	}
-
 	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, deployment, func() error {
+		// Set the owner reference inside the mutate callback so that a
+		// pre-existing same-named Deployment is adopted too.
+		if err := ctrl.SetControllerReference(axonhub, deployment, r.Scheme); err != nil {
+			return fmt.Errorf("setting controller reference: %w", err)
+		}
+
+		deployment.Labels = labelsForAxonHub(axonhub.Name)
 		replicas := r.desiredReplicas(axonhub)
 		deployment.Spec.Replicas = &replicas
-		deployment.Spec.Selector = &metav1.LabelSelector{
-			MatchLabels: labelsForAxonHub(axonhub.Name),
-		}
-		deployment.Spec.Template = corev1.PodTemplateSpec{
-			ObjectMeta: metav1.ObjectMeta{
-				Labels: labelsForAxonHub(axonhub.Name),
-			},
-			Spec: corev1.PodSpec{
-				Containers: []corev1.Container{{
-					Name:            "axonhub",
-					Image:           axonhub.Spec.Image,
-					ImagePullPolicy: corev1.PullIfNotPresent,
-					Ports: []corev1.ContainerPort{{
-						Name:          "http",
-						ContainerPort: axonhubContainerPort,
-						Protocol:      corev1.ProtocolTCP,
+
+		if deployment.CreationTimestamp.IsZero() {
+			// Create path: the selector is immutable, so it can only be
+			// set once; the full template is defined here.
+			deployment.Spec.Selector = &metav1.LabelSelector{
+				MatchLabels: labelsForAxonHub(axonhub.Name),
+			}
+			deployment.Spec.Template = corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: labelsForAxonHub(axonhub.Name),
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Name:            axonhubContainerName,
+						Image:           axonhub.Spec.Image,
+						ImagePullPolicy: corev1.PullIfNotPresent,
+						Ports: []corev1.ContainerPort{{
+							Name:          "http",
+							ContainerPort: axonhubContainerPort,
+							Protocol:      corev1.ProtocolTCP,
+						}},
 					}},
-				}},
-			},
+				},
+			}
+			return nil
+		}
+
+		// Update path: mutate only the fields derived from the spec.
+		deployment.Spec.Template.Labels = labelsForAxonHub(axonhub.Name)
+		for i := range deployment.Spec.Template.Spec.Containers {
+			if deployment.Spec.Template.Spec.Containers[i].Name == axonhubContainerName {
+				deployment.Spec.Template.Spec.Containers[i].Image = axonhub.Spec.Image
+			}
 		}
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("ensuring deployment: %w", err)
 	}
 	return deployment, nil
 }
@@ -151,10 +176,6 @@ func labelsForAxonHub(name string) map[string]string {
 // updateStatus reports the observed state of the managed Deployment on the
 // AxonHub resource's status.
 func (r *AxonHubReconciler) updateStatus(ctx context.Context, axonhub *axonhubv1alpha1.AxonHub, deployment *appsv1.Deployment) error {
-	if deployment == nil {
-		return nil
-	}
-
 	status := axonhub.DeepCopy().Status
 	status.ObservedGeneration = axonhub.Generation
 	status.ReadyReplicas = deployment.Status.ReadyReplicas

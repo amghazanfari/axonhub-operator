@@ -89,6 +89,8 @@ var _ = Describe("AxonHub Controller", func() {
 			Expect(deployment.Spec.Template.Spec.Containers[0].Image).To(Equal("looplj/axonhub:latest"))
 			Expect(deployment.OwnerReferences).To(HaveLen(1))
 			Expect(deployment.OwnerReferences[0].Kind).To(Equal("AxonHub"))
+			Expect(deployment.Labels).To(HaveKeyWithValue("app.kubernetes.io/name", "axonhub"))
+			Expect(deployment.Labels).To(HaveKeyWithValue("app.kubernetes.io/instance", resourceName))
 
 			By("Reporting status with an observed generation and Ready condition")
 			Expect(k8sClient.Get(ctx, typeNamespacedName, axonhub)).To(Succeed())
@@ -106,6 +108,15 @@ var _ = Describe("AxonHub Controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
 			Expect(deployment.Spec.Replicas).To(HaveValue(BeNumerically("==", 3)))
+
+			By("Being a no-op when the spec has not changed")
+			before := deployment.ResourceVersion
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+			Expect(deployment.ResourceVersion).To(Equal(before))
 		})
 	})
 })
