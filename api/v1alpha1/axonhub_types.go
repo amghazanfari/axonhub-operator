@@ -31,6 +31,7 @@ type AxonHubSpec struct {
 	Replicas *int32 `json:"replicas,omitempty"`
 
 	// Image is the AxonHub container image (repository[:tag]).
+	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:default="looplj/axonhub:latest"
 	Image string `json:"image,omitempty"`
 }

@@ -21,6 +21,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -36,6 +37,13 @@ import (
 const (
 	// axonhubContainerPort is the port AxonHub's HTTP server listens on.
 	axonhubContainerPort = 8090
+
+	// AxonHubConditionReady is the condition type reporting overall readiness.
+	AxonHubConditionReady = "Ready"
+
+	// ReasonDeploymentReady / ReasonDeploymentNotReady explain the Ready condition.
+	ReasonDeploymentReady    = "DeploymentReady"
+	ReasonDeploymentNotReady = "DeploymentNotReady"
 )
 
 // AxonHubReconciler reconciles a AxonHub object.
@@ -44,10 +52,10 @@ type AxonHubReconciler struct {
 	Scheme *runtime.Scheme
 }
 
-// +kubebuilder:rbac:groups=axonhub.onrender.com,resources=axonhubs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=axonhub.onrender.com,resources=axonhubs,verbs=get;list;watch
 // +kubebuilder:rbac:groups=axonhub.onrender.com,resources=axonhubs/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=axonhub.onrender.com,resources=axonhubs/finalizers,verbs=update
-// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
 
 // Reconcile moves the cluster state closer to the state described by the
@@ -96,13 +104,6 @@ func (r *AxonHubReconciler) reconcileDeployment(ctx context.Context, axonhub *ax
 		deployment.Spec.Replicas = &replicas
 		deployment.Spec.Selector = &metav1.LabelSelector{
 			MatchLabels: labelsForAxonHub(axonhub.Name),
-		}
-		// The strategy is only set on creation to avoid fighting with
-		// Kubernetes defaults on subsequent updates.
-		if deployment.CreationTimestamp.IsZero() {
-			deployment.Spec.Strategy = appsv1.DeploymentStrategy{
-				Type: appsv1.RollingUpdateDeploymentStrategyType,
-			}
 		}
 		deployment.Spec.Template = corev1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{
@@ -160,42 +161,26 @@ func (r *AxonHubReconciler) updateStatus(ctx context.Context, axonhub *axonhubv1
 
 	ready := deployment.Status.ReadyReplicas >= r.desiredReplicas(axonhub)
 	condition := metav1.Condition{
-		Type:               "Ready",
+		Type:               AxonHubConditionReady,
 		Status:             metav1.ConditionFalse,
 		ObservedGeneration: axonhub.Generation,
-		Reason:             "DeploymentNotReady",
+		Reason:             ReasonDeploymentNotReady,
 		Message:            "AxonHub deployment is not yet ready",
 	}
 	if ready {
 		condition.Status = metav1.ConditionTrue
-		condition.Reason = "DeploymentReady"
+		condition.Reason = ReasonDeploymentReady
 		condition.Message = "AxonHub deployment is ready"
 	}
 	meta.SetStatusCondition(&status.Conditions, condition)
 
-	if !statusEqual(axonhub.Status, status) {
+	if !equality.Semantic.DeepEqual(axonhub.Status, status) {
 		axonhub.Status = status
 		if err := r.Status().Update(ctx, axonhub); err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-// statusEqual reports whether two statuses are equivalent for update purposes.
-func statusEqual(a, b axonhubv1alpha1.AxonHubStatus) bool {
-	if a.ObservedGeneration != b.ObservedGeneration || a.ReadyReplicas != b.ReadyReplicas {
-		return false
-	}
-	if len(a.Conditions) != len(b.Conditions) {
-		return false
-	}
-	for i := range a.Conditions {
-		if a.Conditions[i] != b.Conditions[i] {
-			return false
-		}
-	}
-	return true
 }
 
 // SetupWithManager sets up the controller with the Manager.

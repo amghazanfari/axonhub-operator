@@ -3,5 +3,5 @@ kind: AxonHub
 metadata:
   name: axonhub-sample
 spec:
+  # image intentionally omitted to demonstrate the CRD default (looplj/axonhub:latest)
   replicas: 2
-  image: looplj/axonhub:latest

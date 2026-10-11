@@ -42,6 +42,7 @@ spec:
               image:
                 default: looplj/axonhub:latest
                 description: Image is the AxonHub container image (repository[:tag]).
+                minLength: 1
                 type: string
               replicas:
                 default: 1
