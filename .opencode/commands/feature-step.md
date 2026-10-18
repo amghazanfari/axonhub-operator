@@ -13,6 +13,10 @@ feedback and redo the current stage before asking again.
 
 ## Stage 1 — Plan (STOP after this)
 - Read `AGENTS.md` (the rulebook).
+- Read the project docs for context: `docs/usage.md` (how the operator is
+  used) and `docs/architecture.md` (how it works). Update them in the same
+  change if your feature alters documented behavior, the CRD surface, or the
+  repository layout.
 - Present: the slice you will implement (spec fields, reconcile wiring, tests,
   RBAC changes), the branch name, and the worktree path.
 - Do NOT create the worktree yet — wait for approval.

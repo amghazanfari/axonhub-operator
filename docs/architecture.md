@@ -1,0 +1,95 @@
+# axonhub-operator architecture
+
+## Overview
+
+`axonhub-operator` is a Kubernetes operator built with
+[kubebuilder v4](https://book.kubebuilder.io/) and
+[controller-runtime](https://github.com/kubernetes-sigs/controller-runtime).
+It manages [AxonHub](https://github.com/looplj/axonhub) instances through the
+`AxonHub` custom resource (group `axonhub.onrender.com`, version `v1alpha1`).
+
+## Repository layout
+
+| Path | Purpose |
+| --- | --- |
+| `api/v1alpha1/axonhub_types.go` | CRD spec/status types — the only file to edit for API changes |
+| `api/v1alpha1/zz_generated.deepcopy.go` | generated deepcopy code — never edit |
+| `internal/controller/axonhub_controller.go` | reconcile logic |
+| `internal/controller/axonhub_controller_test.go` | envtest-based controller tests |
+| `cmd/main.go` | manager entrypoint |
+| `config/` | kustomize manifests (CRD, RBAC, manager deployment, samples) |
+| `config/samples/` | example AxonHub CRs |
+| `test/e2e/` | end-to-end tests |
+| `hack/`, `Makefile` | build/test tooling |
+| `PROJECT` | kubebuilder project config |
+
+## Reconciliation model
+
+The controller (`AxonHubReconciler`) follows the standard
+observe → diff → act loop:
+
+1. **Fetch** the `AxonHub` resource; ignore NotFound (owned children are
+   garbage-collected via owner references).
+2. **Ensure the Deployment** (`reconcileDeployment`) using
+   `controllerutil.CreateOrUpdate`:
+   - The controller reference, labels, replicas, and image are always mutated.
+   - The full pod template is set on **creation only** (the selector is
+     immutable); on updates only the labels and the `axonhub` container image
+     are mutated, so API-server-defaulted fields are preserved and
+     steady-state reconciles are no-ops.
+3. **Update status** (`updateStatus`) with the observed generation, ready
+   replica count, and a `Ready` condition (via `meta.SetStatusCondition`).
+   Status writes only happen when the status actually changed.
+
+The manager watches `AxonHub` resources and owned `Deployment` objects
+(`Owns(&appsv1.Deployment{})`), so changes to either trigger a reconcile.
+Reconcile is fully idempotent and never panics.
+
+## Owned resources
+
+For each `AxonHub` CR the operator creates a Deployment in the same
+namespace, named after the CR, with:
+
+- labels: `app.kubernetes.io/name=axonhub`,
+  `app.kubernetes.io/instance=<CR name>`,
+  `app.kubernetes.io/managed-by=axonhub-operator`
+- an owner reference (`ctrl.SetControllerReference`) set inside the mutate
+  callback so pre-existing same-named Deployments are adopted
+- a single `axonhub` container from `spec.image`, HTTP port `8090`
+
+## CRD API
+
+Current spec surface:
+
+- `spec.replicas` (`*int32`, minimum 1, default 1)
+- `spec.image` (string, default `looplj/axonhub:latest`)
+
+Status surface: `observedGeneration`, `readyReplicas`, `conditions`
+(`Ready` = `DeploymentReady` / `DeploymentNotReady`).
+
+## RBAC
+
+Permissions are declared via `kubebuilder:rbac` markers on the reconciler and
+generated into `config/rbac/`:
+
+- `axonhubs` (get/list/watch), `axonhubs/status` (get/update/patch),
+  `axonhubs/finalizers` (update)
+- `apps/deployments` (get/list/watch/create/update/patch)
+
+Any new resource type the controller touches requires new markers followed by
+`make manifests`.
+
+## Testing
+
+- `internal/controller/axonhub_controller_test.go` uses **envtest** (a real
+  kube-apiserver + etcd) to verify reconciliation, ownership, and status
+  behavior end to end at the API level.
+- `test/e2e/` covers against a real cluster.
+
+## Invariants to preserve when changing the controller
+
+- Reconcile must be idempotent and panic-free; wrap errors with context.
+- Every owned child object carries identifying labels and an owner reference.
+- Generated files (`zz_generated.deepcopy.go`, `config/crd/bases/*`) come only
+  from `make generate` / `make manifests`.
+- API edits always run `make generate && make manifests` before commit.
