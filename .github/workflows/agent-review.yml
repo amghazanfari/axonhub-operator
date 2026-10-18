@@ -61,6 +61,8 @@ jobs:
           {
             "permission": {
               "edit": { "*": "deny" },
+              "webfetch": { "*": "deny" },
+              "websearch": { "*": "deny" },
               "bash": {
                 "*": "deny",
                 "git diff*": "allow",
@@ -99,32 +101,178 @@ jobs:
             echo "::error::repo variable LLM_MODEL is not set"
             exit 1
           fi
-          PROMPT="$(git show origin/main:.github/agent/pr-review-prompt.md)"
+          PROMPT="$(cat .github/agent/pr-review-prompt.md)"
           if [ -z "$PROMPT" ]; then
             echo "::error::review prompt is empty"
             exit 1
           fi
           set +e
+          # --format json emits NDJSON events on stdout; logs and progress
+          # go to stderr, so the final message can be extracted cleanly.
+          # No --auto: permission requests are auto-denied in non-interactive
+          # runs, keeping the agent inside its read-only allowlist.
           timeout 12m opencode run \
+            --format json \
             --model "llm/$LLM_MODEL" \
             "$PROMPT" \
-            > /tmp/opencode/pr-review-$PR_NUMBER.out 2>&1
-          echo "exit=$?" >> /tmp/opencode/pr-review-$PR_NUMBER.out
-          test -s /tmp/opencode/pr-review-$PR_NUMBER.out
+            > /tmp/opencode/pr-review-$PR_NUMBER.jsonl \
+            2> /tmp/opencode/pr-review-$PR_NUMBER.log
+          AGENT_EXIT=$?
+          echo "$AGENT_EXIT" > /tmp/opencode/pr-review-$PR_NUMBER.exit
+          echo "exit=$AGENT_EXIT" >> /tmp/opencode/pr-review-$PR_NUMBER.log
+          if [ "$AGENT_EXIT" -eq 124 ]; then
+            echo "::error::agent review timed out after 12m"
+            exit 1
+          fi
+          if [ ! -s /tmp/opencode/pr-review-$PR_NUMBER.jsonl ]; then
+            echo "::error::agent run produced no output (exit $AGENT_EXIT)"
+            cat /tmp/opencode/pr-review-$PR_NUMBER.log || true
+            exit 1
+          fi
+
+      - name: Extract review JSON
+        run: |
+          # Self-hosted runner: /tmp/opencode persists between runs — clear
+          # stale state so a fallback run can never post the previous run's
+          # parsed review.
+          rm -f /tmp/opencode/pr-review-$PR_NUMBER.raw \
+                /tmp/opencode/pr-review-$PR_NUMBER.json \
+                /tmp/opencode/pr-review-comment-$PR_NUMBER.md
+
+          # The agent's final message = the last text emitted in the MAIN
+          # session (the first event carrying a sessionID — subagent events
+          # carry different sessionIDs and must not shadow the review). Join
+          # the text parts of that message and strip Markdown code fences.
+          jq -rs '
+            ([.[] | .sessionID?] | map(select(. != null)) | first) as $main
+            | [.[] | select(.type == "text" and .sessionID == $main)] as $t
+            | if ($t | length) == 0 then empty
+              else ($t | last | .part.messageID) as $mid
+              | [$t[] | select(.part.messageID == $mid) | .part.text]
+              | join("\n")
+              end
+          ' /tmp/opencode/pr-review-$PR_NUMBER.jsonl \
+            | sed -E -e 's/^[[:space:]]*```(json)?[[:space:]]*$//' \
+            | tr -d '\r' > /tmp/opencode/pr-review-$PR_NUMBER.raw
+
+          # Validate the contract, then save the object itself (not the
+          # boolean result) for the render step.
+          if jq -e '
+              (.verdict == "APPROVE" or .verdict == "APPROVE_WITH_NITS" or .verdict == "REQUEST_CHANGES")
+              and (.summary | type == "string")
+              and (.findings | type == "array")
+              and (all(.findings[]?; type == "object"))
+              and (all(.findings[]?; (.severity // "nit") | IN("blocker", "major", "minor", "nit")))
+              and (all(.findings[]?; (.line == null) or (.line | type == "number")))
+              and (all(.findings[]?; (.file // "" | type == "string")))
+              and (all(.findings[]?; (.message // "" | type == "string")))
+            ' /tmp/opencode/pr-review-$PR_NUMBER.raw > /dev/null 2>&1; then
+            jq '.' /tmp/opencode/pr-review-$PR_NUMBER.raw > /tmp/opencode/pr-review-$PR_NUMBER.json
+            echo "review_format=json"
+          elif [ -s /tmp/opencode/pr-review-$PR_NUMBER.raw ]; then
+            echo "review_format=fallback"
+          else
+            echo "::error::agent produced no final message"
+            exit 1
+          fi
 
       - name: Post review comment
         env:
           GH_TOKEN: ${{ github.token }}
-          LLM_MODEL: ${{ vars.LLM_MODEL }}
         run: |
-          {
-            echo "## 🤖 Agent Review"
-            echo ""
-            sed -E -e 's/\x1b\[[0-9;]*m//g' -e '/^[→>$] /d' -e '/Permission denied/d' -e '/^✗ /d' -e "s/$LLM_MODEL//g" \
-              /tmp/opencode/pr-review-$PR_NUMBER.out
-            echo ""
-            echo "---"
-            echo "*Triggered by \`${{ github.event_name }}\` • base \`${BASE_SHA:0:7}\` → head \`${HEAD_SHA:0:7}\`*"
-          } > /tmp/opencode/pr-review-comment-$PR_NUMBER.md
-          gh pr comment "$PR_NUMBER" --body-file /tmp/opencode/pr-review-comment-$PR_NUMBER.md
-          rm -f .opencode/opencode.json
+          COMMENT=/tmp/opencode/pr-review-comment-$PR_NUMBER.md
+          JSON=/tmp/opencode/pr-review-$PR_NUMBER.json
+          RAW=/tmp/opencode/pr-review-$PR_NUMBER.raw
+
+          if [ -s "$JSON" ]; then
+            VERDICT=$(jq -r .verdict "$JSON")
+            SUMMARY=$(jq -r .summary "$JSON")
+
+            case "$VERDICT" in
+              APPROVE)              BADGE="🟢 **APPROVE**" ;;
+              APPROVE_WITH_NITS)    BADGE="🟡 **APPROVE WITH NITS**" ;;
+              *)                    BADGE="🔴 **REQUEST CHANGES**" ;;
+            esac
+
+            {
+              echo "## 🤖 Agent Review"
+              echo
+              echo "$BADGE"
+              echo
+              echo "$SUMMARY"
+              echo
+              if [ "$(jq '.findings | length' "$JSON")" -gt 0 ]; then
+                echo "### Findings"
+                echo
+                echo "| # | Severity | Location | Finding |"
+                echo "|:-:|:--------:|:---------|:--------|"
+                jq -r '
+                  .findings
+                  | to_entries[]
+                  | [ (.key + 1),
+                      (.value.severity // "nit"),
+                      (if (.value.line // 0) > 0
+                        then "\(.value.file // "?"):\(.value.line)"
+                        else (.value.file // "?") end),
+                      (.value.message // "")
+                  ] | @tsv
+                ' "$JSON" | awk -F'\t' '
+                  {
+                    sev = $2
+                    icon = (sev == "blocker") ? "🚨" : (sev == "major") ? "⚠️" : (sev == "minor") ? "🔸" : "🔹"
+                    # @tsv escapes newlines/tabs as literal \n / \t sequences
+                    gsub(/\\[nrt]/, " ", $4)
+                    gsub(/[|]/, " ", $4)
+                    gsub(/[|`]/, " ", $3)
+                    printf "| %s | %s %s | `%s` | %s |\n", $1, icon, sev, $3, $4
+                  }
+                '
+                echo
+              fi
+              echo "<details>"
+              echo "<summary>Review metadata</summary>"
+              echo
+              echo "- Verdict: \`${VERDICT}\`"
+              echo "- Base \`${BASE_SHA:0:7}\` → head \`${HEAD_SHA:0:7}\`"
+              echo "- Agent exit code: \`$(cat /tmp/opencode/pr-review-$PR_NUMBER.exit 2>/dev/null || echo unknown)\`"
+              echo "- Triggered by \`${{ github.event_name }}\`"
+              echo
+              echo "</details>"
+            } > "$COMMENT"
+          else
+            # The agent did not return parseable JSON — post its raw final
+            # message collapsed instead of dumping it at full size.
+            {
+              echo "## 🤖 Agent Review"
+              echo
+              echo "⚠️ The agent could not produce a structured review. Raw output:"
+              echo
+              echo "<details>"
+              echo "<summary>Agent message (unparsed)</summary>"
+              echo
+              echo '```markdown'
+              cat "$RAW"
+              echo '```'
+              echo
+              echo "</details>"
+            } > "$COMMENT"
+          fi
+
+          gh pr comment "$PR_NUMBER" --body-file "$COMMENT"
+
+      - name: Clean up opencode config
+        # The generated config contains the live LLM_API_KEY; always remove
+        # it, even when earlier steps fail.
+        if: always()
+        run: rm -f .opencode/opencode.json
+
+      - name: Upload review logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-review-${{ env.PR_NUMBER }}
+          path: |
+            /tmp/opencode/pr-review-${{ env.PR_NUMBER }}.jsonl
+            /tmp/opencode/pr-review-${{ env.PR_NUMBER }}.log
+          retention-days: 7
+          if-no-files-found: ignore
