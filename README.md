@@ -1,8 +1,20 @@
 # axonhub-operator
-// TODO(user): Add simple overview of use/purpose
+
+A Kubernetes operator that manages [AxonHub](https://github.com/looplj/axonhub)
+(an all-in-one AI gateway platform, Go backend + React frontend) through the
+`AxonHub` custom resource.
+
+- **[Usage guide](docs/usage.md)** — install the operator, create `AxonHub`
+  instances, scale, upgrade, and check status.
+- **[Architecture](docs/architecture.md)** — repository layout, reconciliation
+  model, owned resources, RBAC, and testing strategy.
 
 ## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+
+The operator deploys and manages AxonHub instances on Kubernetes through the
+`AxonHub` custom resource (group `axonhub.onrender.com`, version `v1alpha1`):
+it creates and owns a Deployment per `AxonHub` instance, keeps replicas and
+image in sync with the spec, and reports readiness on the resource's status.
 
 ## Getting Started
 
