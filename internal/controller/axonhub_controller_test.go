@@ -22,6 +22,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/types"
@@ -36,12 +37,13 @@ import (
 var _ = Describe("AxonHub Controller", func() {
 	Context("When reconciling a resource", func() {
 		const resourceName = "test-resource"
+		const testNamespace = "default"
 
 		ctx := context.Background()
 
 		typeNamespacedName := types.NamespacedName{
 			Name:      resourceName,
-			Namespace: "default", // TODO(user):Modify as needed
+			Namespace: testNamespace,
 		}
 		axonhub := &axonhubv1alpha1.AxonHub{}
 
@@ -52,7 +54,7 @@ var _ = Describe("AxonHub Controller", func() {
 				resource := &axonhubv1alpha1.AxonHub{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      resourceName,
-						Namespace: "default",
+						Namespace: testNamespace,
 					},
 					// TODO(user): Specify other spec details if needed.
 				}
@@ -92,6 +94,21 @@ var _ = Describe("AxonHub Controller", func() {
 			Expect(deployment.Labels).To(HaveKeyWithValue("app.kubernetes.io/name", "axonhub"))
 			Expect(deployment.Labels).To(HaveKeyWithValue("app.kubernetes.io/instance", resourceName))
 
+			By("Creating an owned Service exposing the AxonHub HTTP port")
+			service := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, service)).To(Succeed())
+			Expect(service.Spec.Type).To(Equal(corev1.ServiceTypeClusterIP))
+			Expect(service.Spec.Selector).To(HaveKeyWithValue("app.kubernetes.io/name", "axonhub"))
+			Expect(service.Spec.Selector).To(HaveKeyWithValue("app.kubernetes.io/instance", resourceName))
+			Expect(service.Spec.Ports).To(HaveLen(1))
+			Expect(service.Spec.Ports[0].Name).To(Equal("http"))
+			Expect(service.Spec.Ports[0].Port).To(Equal(int32(8090)))
+			Expect(service.Spec.Ports[0].TargetPort.String()).To(Equal("http"))
+			Expect(service.Spec.Ports[0].Protocol).To(Equal(corev1.ProtocolTCP))
+			Expect(service.OwnerReferences).To(HaveLen(1))
+			Expect(service.OwnerReferences[0].Kind).To(Equal("AxonHub"))
+			Expect(service.Labels).To(HaveKeyWithValue("app.kubernetes.io/managed-by", "axonhub-operator"))
+
 			By("Reporting status with an observed generation and Ready condition")
 			Expect(k8sClient.Get(ctx, typeNamespacedName, axonhub)).To(Succeed())
 			Expect(axonhub.Status.ObservedGeneration).To(Equal(axonhub.Generation))
@@ -111,12 +128,57 @@ var _ = Describe("AxonHub Controller", func() {
 
 			By("Being a no-op when the spec has not changed")
 			before := deployment.ResourceVersion
+			serviceBefore := service.ResourceVersion
 			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
 			Expect(deployment.ResourceVersion).To(Equal(before))
+			Expect(k8sClient.Get(ctx, typeNamespacedName, service)).To(Succeed())
+			Expect(service.ResourceVersion).To(Equal(serviceBefore))
+		})
+		It("should fail loudly when a pre-existing Service has a conflicting selector", func() {
+			By("Creating a Service with an unrelated immutable selector")
+			conflictName := types.NamespacedName{Name: "conflict-resource", Namespace: testNamespace}
+			conflictingService := &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      conflictName.Name,
+					Namespace: conflictName.Namespace,
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: map[string]string{"app": "something-else"},
+					Ports: []corev1.ServicePort{{
+						Port: 80,
+					}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, conflictingService)).To(Succeed())
+
+			By("Creating an AxonHub resource with the same name")
+			resource := &axonhubv1alpha1.AxonHub{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      conflictName.Name,
+					Namespace: conflictName.Namespace,
+				},
+			}
+			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+			defer func() {
+				Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+				Expect(k8sClient.Delete(ctx, conflictingService)).To(Succeed())
+			}()
+
+			By("Reconciling and expecting a descriptive error, not silent misrouting")
+			controllerReconciler := &AxonHubReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: conflictName,
+			})
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("conflicting immutable selector"))
 		})
 	})
 })
