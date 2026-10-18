@@ -37,25 +37,38 @@ observe → diff → act loop:
      immutable); on updates only the labels and the `axonhub` container image
      are mutated, so API-server-defaulted fields are preserved and
      steady-state reconciles are no-ops.
-3. **Update status** (`updateStatus`) with the observed generation, ready
+3. **Ensure the Service** (`reconcileService`) the same way: a ClusterIP
+   Service named after the CR, selecting the pods by label and routing
+   port `8090` to the `http` target port. The selector is set on creation
+   only; on updates only labels and the port are mutated.
+4. **Update status** (`updateStatus`) with the observed generation, ready
    replica count, and a `Ready` condition (via `meta.SetStatusCondition`).
    Status writes only happen when the status actually changed.
 
-The manager watches `AxonHub` resources and owned `Deployment` objects
-(`Owns(&appsv1.Deployment{})`), so changes to either trigger a reconcile.
+The manager watches `AxonHub` resources and owned `Deployment`/`Service`
+objects (`Owns(&appsv1.Deployment{})`, `Owns(&corev1.Service{})`), so changes
+to any of them trigger a reconcile.
 Reconcile is fully idempotent and never panics.
 
 ## Owned resources
 
-For each `AxonHub` CR the operator creates a Deployment in the same
-namespace, named after the CR, with:
+For each `AxonHub` CR the operator creates, in the same namespace and named
+after the CR:
 
-- labels: `app.kubernetes.io/name=axonhub`,
-  `app.kubernetes.io/instance=<CR name>`,
-  `app.kubernetes.io/managed-by=axonhub-operator`
-- an owner reference (`ctrl.SetControllerReference`) set inside the mutate
-  callback so pre-existing same-named Deployments are adopted
-- a single `axonhub` container from `spec.image`, HTTP port `8090`
+- a **Deployment** with:
+  - labels: `app.kubernetes.io/name=axonhub`,
+    `app.kubernetes.io/instance=<CR name>`,
+    `app.kubernetes.io/managed-by=axonhub-operator`
+  - a single `axonhub` container from `spec.image`, HTTP port `8090`
+- a **ClusterIP Service** selecting those pods, exposing TCP port `8090`
+  (`http` → target port `http`)
+
+Both carry an owner reference (`ctrl.SetControllerReference`) set inside the
+mutate callback so pre-existing same-named objects are adopted. Adoption is
+best-effort: a pre-existing Service whose immutable selector does not match
+the managed pods fails the reconcile with a descriptive error, and an adopted
+Service of another type (NodePort/LoadBalancer) keeps its type since the API
+server forbids changing it back to ClusterIP.
 
 ## CRD API
 
@@ -75,6 +88,7 @@ generated into `config/rbac/`:
 - `axonhubs` (get/list/watch), `axonhubs/status` (get/update/patch),
   `axonhubs/finalizers` (update)
 - `apps/deployments` (get/list/watch/create/update/patch)
+- core `services` (get/list/watch/create/update/patch)
 
 Any new resource type the controller touches requires new markers followed by
 `make manifests`.

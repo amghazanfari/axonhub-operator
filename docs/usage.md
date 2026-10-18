@@ -60,11 +60,21 @@ defaults (`1` replica and `looplj/axonhub:latest`).
 
 The operator creates a Deployment named after the `AxonHub` resource in the
 same namespace, with one container (named `axonhub`) per pod that serves HTTP
-on port `8090`. The Deployment carries an owner reference and
+on port `8090`. It also creates a ClusterIP Service with the same name that
+routes port `8090` (`http`) to the pods. Both carry an owner reference and
 `app.kubernetes.io/*` labels, so deleting the `AxonHub` resource garbage
-collects the Deployment.
+collects them.
 
-## Checking status
+## Checking status and accessing AxonHub
+
+Once the `Ready` condition is true, the AxonHub HTTP API is reachable inside
+the cluster through the operator-created Service:
+
+```sh
+kubectl get service my-axonhub
+kubectl run curl --rm -it --image=curlimages/curl -- \
+  curl http://my-axonhub.default.svc.cluster.local:8090
+```
 
 The operator reports the observed state on the resource's status:
 
