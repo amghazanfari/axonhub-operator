@@ -371,6 +371,26 @@ var _ = Describe("AxonHub Controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(recorder.Events).ToNot(Receive())
 
+			By("Not re-emitting the Event on an incidental status change (spec edit)")
+			resource.Spec.Replicas = ptr.To(int32(3))
+			Expect(k8sClient.Update(ctx, resource)).To(Succeed())
+			_, err = reconcileWithRecorder(recorder, namespacedName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(recorder.Events).ToNot(Receive())
+			ready = meta.FindStatusCondition(getAxonHubAt(namespacedName).Status.Conditions, AxonHubConditionReady)
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Reason).To(Equal(ReasonChildObjectAlreadyOwned))
+			Expect(ready.ObservedGeneration).To(Equal(getAxonHubAt(namespacedName).Generation))
+
+			By("Coping with a nil event recorder (no panic, condition still reported)")
+			nilRecorder := &AxonHubReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+			result, err = nilRecorder.Reconcile(ctx, reconcile.Request{NamespacedName: namespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(alreadyOwnedRequeueInterval))
+			ready = meta.FindStatusCondition(getAxonHubAt(namespacedName).Status.Conditions, AxonHubConditionReady)
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Reason).To(Equal(ReasonChildObjectAlreadyOwned))
+
 			By("Not having mutated the conflicting Deployment's owner references")
 			Expect(k8sClient.Get(ctx, namespacedName, conflictingDeployment)).To(Succeed())
 			Expect(conflictingDeployment.OwnerReferences).To(HaveLen(1))
@@ -431,9 +451,10 @@ var _ = Describe("AxonHub Controller", func() {
 
 			By("Deleting the conflicting Service and reconciling again recovers")
 			Expect(k8sClient.Delete(ctx, conflictingService)).To(Succeed())
-			result, err = reconcileWithRecorder(record.NewFakeRecorder(10), namespacedName)
+			result, err = reconcileWithRecorder(recorder, namespacedName)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(result.RequeueAfter).To(BeZero())
+			Expect(recorder.Events).ToNot(Receive())
 
 			service := &corev1.Service{}
 			Expect(k8sClient.Get(ctx, namespacedName, service)).To(Succeed())

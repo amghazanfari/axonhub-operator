@@ -84,7 +84,9 @@ of failing the reconcile in a hot retry loop, the controller:
   and RBAC grants create/patch on events),
 - returns a periodic requeue (every 2 minutes) rather than an error, so the
   conflict is retried calmly and resolves automatically once the conflicting
-  object is deleted or the resource renamed.
+  object is deleted or the resource renamed. Since the conflicting object is
+  not owned by this controller, its deletion does not trigger a watch event,
+  so recovery can lag up to the full requeue interval.
 
 ## CRD API
 
