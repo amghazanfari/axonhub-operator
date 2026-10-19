@@ -164,6 +164,7 @@ var _ = Describe("AxonHub Controller", func() {
 			Expect(deployment.Spec.Replicas).To(HaveValue(BeNumerically("==", 1)))
 			Expect(deployment.Spec.Template.Spec.Containers[0].Name).To(Equal("axonhub"))
 			Expect(deployment.Spec.Template.Spec.Containers[0].Image).To(Equal("looplj/axonhub:latest"))
+			Expect(deployment.Spec.Template.Spec.Containers[0].ImagePullPolicy).To(Equal(corev1.PullAlways))
 			Expect(deployment.OwnerReferences).To(HaveLen(1))
 			Expect(deployment.OwnerReferences[0].Kind).To(Equal("AxonHub"))
 			Expect(deployment.Labels).To(HaveKeyWithValue("app.kubernetes.io/name", "axonhub"))
@@ -184,6 +185,17 @@ var _ = Describe("AxonHub Controller", func() {
 			Expect(service.OwnerReferences[0].Kind).To(Equal("AxonHub"))
 			Expect(service.Labels).To(HaveKeyWithValue("app.kubernetes.io/managed-by", "axonhub-operator"))
 
+			By("Setting a security context compatible with the restricted PSS")
+			podSC := deployment.Spec.Template.Spec.SecurityContext
+			Expect(podSC).NotTo(BeNil())
+			Expect(podSC.RunAsNonRoot).To(HaveValue(BeTrue()))
+			Expect(podSC.SeccompProfile.Type).To(Equal(corev1.SeccompProfileTypeRuntimeDefault))
+			containerSC := deployment.Spec.Template.Spec.Containers[0].SecurityContext
+			Expect(containerSC).NotTo(BeNil())
+			Expect(containerSC.AllowPrivilegeEscalation).To(HaveValue(BeFalse()))
+			Expect(containerSC.Capabilities.Drop).To(ContainElement(corev1.Capability("ALL")))
+			Expect(deployment.Spec.Template.Spec.Containers[0].Resources.Requests).To(HaveKey(corev1.ResourceCPU))
+
 			By("Reporting status with an observed generation and Ready condition")
 			Expect(k8sClient.Get(ctx, typeNamespacedName, axonhub)).To(Succeed())
 			Expect(axonhub.Status.ObservedGeneration).To(Equal(axonhub.Generation))
@@ -191,8 +203,9 @@ var _ = Describe("AxonHub Controller", func() {
 			Expect(ready).NotTo(BeNil())
 			Expect(ready.Reason).To(Equal(ReasonDeploymentStatusNotObservedYet))
 
-			By("Reconciling again to update the spec")
+			By("Propagating spec changes to the deployment")
 			axonhub.Spec.Replicas = ptr.To(int32(3))
+			axonhub.Spec.Image = "looplj/axonhub:v1.0.0"
 			Expect(k8sClient.Update(ctx, axonhub)).To(Succeed())
 			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
@@ -200,6 +213,8 @@ var _ = Describe("AxonHub Controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
 			Expect(deployment.Spec.Replicas).To(HaveValue(BeNumerically("==", 3)))
+			Expect(deployment.Spec.Template.Spec.Containers[0].Image).To(Equal("looplj/axonhub:v1.0.0"))
+			Expect(deployment.Spec.Template.Spec.Containers[0].ImagePullPolicy).To(Equal(corev1.PullIfNotPresent))
 
 			By("Being a no-op when the spec has not changed")
 			before := deployment.ResourceVersion
@@ -518,6 +533,49 @@ var _ = Describe("AxonHub Controller", func() {
 			Expect(ready).NotTo(BeNil())
 			Expect(ready.Status).To(Equal(metav1.ConditionTrue))
 			Expect(ready.Reason).To(Equal(ReasonDeploymentReady))
+		})
+
+		It("should error when the deployment has no axonhub container", func() {
+			By("Reconciling the created resource")
+			controllerReconciler := &AxonHubReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Replacing the deployment with one that has a foreign container")
+			deployment := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+			deployment.Spec.Template.Spec.Containers = []corev1.Container{{
+				Name:  "other",
+				Image: "nginx:1.27",
+			}}
+			Expect(k8sClient.Update(ctx, deployment)).To(Succeed())
+			drifted := deployment.ResourceVersion
+
+			By("Failing to reconcile the drifted deployment")
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("no \"axonhub\" container"))
+
+			By("Surfacing the failure on the Ready condition instead of freezing status")
+			Expect(k8sClient.Get(ctx, typeNamespacedName, axonhub)).To(Succeed())
+			ready := meta.FindStatusCondition(axonhub.Status.Conditions, "Ready")
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+			Expect(ready.Reason).To(Equal(ReasonDeploymentReconcileFailed))
+			Expect(ready.Message).To(ContainSubstring("no \"axonhub\" container"))
+
+			By("Not having mutated the drifted deployment")
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+			Expect(deployment.Spec.Template.Spec.Containers).To(HaveLen(1))
+			Expect(deployment.Spec.Template.Spec.Containers[0].Name).To(Equal("other"))
+			Expect(deployment.ResourceVersion).To(Equal(drifted))
 		})
 	})
 })

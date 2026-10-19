@@ -19,15 +19,18 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -47,6 +50,15 @@ const (
 	// container and the Service.
 	axonhubPortName = "http"
 
+	// mutableTagSuffix is the tag suffix (or absence of a tag) that marks an
+	// image reference as mutable, requiring an Always pull policy.
+	mutableTagSuffix = "latest"
+
+	// axonhubUID is the non-root UID/GID the AxonHub container runs as. The
+	// upstream image has no USER directive (root), so an explicit identity
+	// is required for restricted-PSS compliance.
+	axonhubUID = int64(1000)
+
 	// AxonHubConditionReady is the condition type reporting overall readiness.
 	AxonHubConditionReady = "Ready"
 
@@ -58,6 +70,7 @@ const (
 	ReasonDeploymentReplicasNotReady     = "DeploymentReplicasNotReady"
 	ReasonDeploymentAvailableUnknown     = "DeploymentAvailableUnknown"
 	ReasonDeploymentRolloutInProgress    = "DeploymentRolloutInProgress"
+	ReasonDeploymentReconcileFailed      = "DeploymentReconcileFailed"
 )
 
 // AxonHubReconciler reconciles a AxonHub object.
@@ -68,6 +81,11 @@ type AxonHubReconciler struct {
 
 // +kubebuilder:rbac:groups=axonhub.onrender.com,resources=axonhubs,verbs=get;list;watch
 // +kubebuilder:rbac:groups=axonhub.onrender.com,resources=axonhubs/status,verbs=get;update;patch
+// axonhubs/finalizers is not unused: SetControllerReference sets
+// blockOwnerDeletion on the child objects, and with
+// OwnerReferencesPermissionEnforcement enabled (e.g. OpenShift) creating or
+// updating owned children is forbidden without update permission on the
+// owner's finalizers subresource.
 // +kubebuilder:rbac:groups=axonhub.onrender.com,resources=axonhubs/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch
@@ -89,6 +107,13 @@ func (r *AxonHubReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	deployment, err := r.reconcileDeployment(ctx, &axonhub)
 	if err != nil {
+		// Surface the failure on the status before returning the error,
+		// so the Ready condition does not freeze at a stale value while
+		// the reconcile keeps retrying (e.g. a drifted Deployment that
+		// cannot be reconciled).
+		if statusErr := r.reportReconcileFailure(ctx, &axonhub, err); statusErr != nil {
+			log.Error(statusErr, "failed to report reconcile failure on the AxonHub status")
+		}
 		return ctrl.Result{}, err
 	}
 
@@ -103,13 +128,40 @@ func (r *AxonHubReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	return ctrl.Result{}, nil
 }
 
+// reportReconcileFailure sets the Ready condition to False with a
+// ReconcileFailed reason, so reconcile errors that keep retrying (such as a
+// drifted owned Deployment) are visible on the status instead of silently
+// freezing it at stale values.
+func (r *AxonHubReconciler) reportReconcileFailure(ctx context.Context, axonhub *axonhubv1alpha1.AxonHub, reconcileErr error) error {
+	status := axonhub.DeepCopy().Status
+	status.ObservedGeneration = axonhub.Generation
+	meta.SetStatusCondition(&status.Conditions, metav1.Condition{
+		Type:               AxonHubConditionReady,
+		Status:             metav1.ConditionFalse,
+		ObservedGeneration: axonhub.Generation,
+		Reason:             ReasonDeploymentReconcileFailed,
+		Message:            fmt.Sprintf("Reconciling the AxonHub deployment failed: %s", reconcileErr.Error()),
+	})
+
+	if !equality.Semantic.DeepEqual(axonhub.Status, status) {
+		axonhub.Status = status
+		if err := r.Status().Update(ctx, axonhub); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // reconcileDeployment ensures a Deployment owned by the AxonHub resource
 // exists and matches the desired spec.
 //
-// The mutate callback only assigns fields the operator owns. The full
-// pod template is set on creation only; on updates just the desired
-// replicas and image are mutated so that API-server-defaulted fields are
-// preserved and steady-state reconciles are true no-ops.
+// The mutate callback merges our labels into any existing ones and assigns
+// the fields the operator owns. The immutable pod-template selector is set
+// on creation only; the axonhub container's spec (image, pull policy, env,
+// ports, security context, resources) is fully derived from the AxonHub
+// resource on every reconcile, so drifted or adopted Deployments are
+// repaired. A Deployment without an axonhub container cannot be reconciled
+// and fails loudly instead of silently no-oping.
 func (r *AxonHubReconciler) reconcileDeployment(ctx context.Context, axonhub *axonhubv1alpha1.AxonHub) (*appsv1.Deployment, error) {
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -125,44 +177,45 @@ func (r *AxonHubReconciler) reconcileDeployment(ctx context.Context, axonhub *ax
 			return fmt.Errorf("setting controller reference: %w", err)
 		}
 
-		deployment.Labels = labelsForAxonHub(axonhub.Name)
+		// Merge our labels into any labels other actors may have set, so
+		// they are preserved instead of replaced wholesale.
+		if deployment.Labels == nil {
+			deployment.Labels = map[string]string{}
+		}
+		mergeLabels(deployment.Labels, labelsForAxonHub(axonhub.Name))
 		replicas := r.desiredReplicas(axonhub)
 		deployment.Spec.Replicas = &replicas
 
 		if deployment.CreationTimestamp.IsZero() {
 			// Create path: the selector is immutable, so it can only be
-			// set once; the full template is defined here.
+			// set once; the template skeleton is defined here.
 			deployment.Spec.Selector = &metav1.LabelSelector{
 				MatchLabels: labelsForAxonHub(axonhub.Name),
 			}
 			deployment.Spec.Template = corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: labelsForAxonHub(axonhub.Name),
+					Labels: map[string]string{},
 				},
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{{
-						Name:            axonhubContainerName,
-						Image:           axonhub.Spec.Image,
-						ImagePullPolicy: corev1.PullIfNotPresent,
-						Env:             dbEnvForAxonHub(axonhub),
-						Ports: []corev1.ContainerPort{{
-							Name:          axonhubPortName,
-							ContainerPort: axonhubContainerPort,
-							Protocol:      corev1.ProtocolTCP,
-						}},
+						Name: axonhubContainerName,
 					}},
 				},
 			}
-			return nil
 		}
+		if deployment.Spec.Template.Labels == nil {
+			deployment.Spec.Template.Labels = map[string]string{}
+		}
+		mergeLabels(deployment.Spec.Template.Labels, labelsForAxonHub(axonhub.Name))
 
-		// Update path: mutate only the fields derived from the spec.
-		deployment.Spec.Template.Labels = labelsForAxonHub(axonhub.Name)
-		for i := range deployment.Spec.Template.Spec.Containers {
-			if deployment.Spec.Template.Spec.Containers[i].Name == axonhubContainerName {
-				deployment.Spec.Template.Spec.Containers[i].Image = axonhub.Spec.Image
-				deployment.Spec.Template.Spec.Containers[i].Env = dbEnvForAxonHub(axonhub)
-			}
+		// Applied on every reconcile so drifted or adopted Deployments are
+		// also brought up to restricted-PSS-compatible defaults.
+		deployment.Spec.Template.Spec.SecurityContext = podSecurityContext()
+
+		// Both paths converge here: the axonhub container's spec is fully
+		// derived from the AxonHub resource on every reconcile.
+		if err := ensureAxonHubContainer(deployment, axonhub); err != nil {
+			return fmt.Errorf("ensuring axonhub container: %w", err)
 		}
 		return nil
 	})
@@ -253,6 +306,96 @@ func dbEnvForAxonHub(axonhub *axonhubv1alpha1.AxonHub) []corev1.EnvVar {
 	return []corev1.EnvVar{
 		{Name: "AXONHUB_DB_DIALECT", Value: axonhub.Spec.DB.Type},
 		{Name: "AXONHUB_DB_DSN", Value: axonhub.Spec.DB.Address},
+	}
+}
+
+// ensureAxonHubContainer reconciles the axonhub container of the Deployment's
+// pod template with the desired spec. The container must already exist: a
+// drifted or adopted Deployment without it cannot be reconciled silently.
+func ensureAxonHubContainer(deployment *appsv1.Deployment, axonhub *axonhubv1alpha1.AxonHub) error {
+	for i := range deployment.Spec.Template.Spec.Containers {
+		container := &deployment.Spec.Template.Spec.Containers[i]
+		if container.Name != axonhubContainerName {
+			continue
+		}
+		container.Image = axonhub.Spec.Image
+		container.ImagePullPolicy = pullPolicyFor(axonhub.Spec.Image)
+		container.Env = dbEnvForAxonHub(axonhub)
+		container.Ports = []corev1.ContainerPort{{
+			Name:          axonhubPortName,
+			ContainerPort: axonhubContainerPort,
+			Protocol:      corev1.ProtocolTCP,
+		}}
+		container.SecurityContext = containerSecurityContext()
+		container.Resources = corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("100m"),
+				corev1.ResourceMemory: resource.MustParse("128Mi"),
+			},
+		}
+		return nil
+	}
+	return fmt.Errorf("deployment %s/%s has no %q container; refusing to mutate a drifted or adopted Deployment",
+		deployment.Namespace, deployment.Name, axonhubContainerName)
+}
+
+// pullPolicyFor returns the image pull policy for the given image reference.
+// Mutable tags (":latest" or no tag at all) must always be pulled, otherwise
+// re-pushed images would never reach nodes that already cached the tag.
+// Digest references (img@sha256:...) and pinned tags are immutable, so
+// IfNotPresent is safe for them.
+func pullPolicyFor(image string) corev1.PullPolicy {
+	if strings.Contains(image, "@") {
+		return corev1.PullIfNotPresent
+	}
+	tag := image[strings.LastIndex(image, "/")+1:]
+	if i := strings.LastIndex(tag, ":"); i >= 0 {
+		tag = tag[i+1:]
+	} else {
+		tag = "" // no tag means :latest
+	}
+	if tag == "" || tag == mutableTagSuffix {
+		return corev1.PullAlways
+	}
+	return corev1.PullIfNotPresent
+}
+
+// podSecurityContext returns the pod-level security context, compatible with
+// the restricted Pod Security Standard. The upstream looplj/axonhub image
+// does not declare a USER and defaults to root, so an explicit non-root
+// UID/GID is required for RunAsNonRoot to hold. fsGroup makes mounted PVCs
+// group-writable so AxonHub can persist its SQLite database.
+func podSecurityContext() *corev1.PodSecurityContext {
+	return &corev1.PodSecurityContext{
+		RunAsUser:    ptr.To[int64](axonhubUID),
+		RunAsGroup:   ptr.To[int64](axonhubUID),
+		RunAsNonRoot: ptr.To(true),
+		FSGroup:      ptr.To[int64](axonhubUID),
+		SeccompProfile: &corev1.SeccompProfile{
+			Type: corev1.SeccompProfileTypeRuntimeDefault,
+		},
+	}
+}
+
+// containerSecurityContext returns the container-level security context,
+// compatible with the restricted Pod Security Standard.
+func containerSecurityContext() *corev1.SecurityContext {
+	return &corev1.SecurityContext{
+		AllowPrivilegeEscalation: ptr.To(false),
+		Capabilities: &corev1.Capabilities{
+			Drop: []corev1.Capability{"ALL"},
+		},
+		SeccompProfile: &corev1.SeccompProfile{
+			Type: corev1.SeccompProfileTypeRuntimeDefault,
+		},
+	}
+}
+
+// mergeLabels merges src into dst without removing keys already present in
+// dst that are not managed by the operator.
+func mergeLabels(dst, src map[string]string) {
+	for k, v := range src {
+		dst[k] = v
 	}
 }
 
