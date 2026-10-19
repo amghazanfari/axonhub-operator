@@ -26,6 +26,11 @@ import (
 // AxonHubSpec defines the desired state of AxonHub.
 type AxonHubSpec struct {
 	// Replicas is the desired number of AxonHub pods.
+	// The minimum is intentionally 1 (not 0): the operator does not manage a
+	// drain/maintenance workflow that would require scale-to-zero, and with
+	// the default local SQLite storage (see spec.db) a pod must be running
+	// for AxonHub to stay reachable. Removing the workload entirely should
+	// be done by deleting the AxonHub resource, which garbage-collects it.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=1
 	Replicas *int32 `json:"replicas,omitempty"`

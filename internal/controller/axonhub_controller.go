@@ -50,9 +50,14 @@ const (
 	// AxonHubConditionReady is the condition type reporting overall readiness.
 	AxonHubConditionReady = "Ready"
 
-	// ReasonDeploymentReady / ReasonDeploymentNotReady explain the Ready condition.
-	ReasonDeploymentReady    = "DeploymentReady"
-	ReasonDeploymentNotReady = "DeploymentNotReady"
+	// Reasons explaining the Ready condition.
+	ReasonDeploymentReady                = "DeploymentReady"
+	ReasonDeploymentStatusNotObservedYet = "DeploymentStatusNotObservedYet"
+	ReasonDeploymentGenerationStale      = "DeploymentGenerationStale"
+	ReasonDeploymentUnavailable          = "DeploymentUnavailable"
+	ReasonDeploymentReplicasNotReady     = "DeploymentReplicasNotReady"
+	ReasonDeploymentAvailableUnknown     = "DeploymentAvailableUnknown"
+	ReasonDeploymentRolloutInProgress    = "DeploymentRolloutInProgress"
 )
 
 // AxonHubReconciler reconciles a AxonHub object.
@@ -276,18 +281,18 @@ func (r *AxonHubReconciler) updateStatus(ctx context.Context, axonhub *axonhubv1
 	status.ObservedGeneration = axonhub.Generation
 	status.ReadyReplicas = deployment.Status.ReadyReplicas
 
-	ready := deployment.Status.ReadyReplicas >= r.desiredReplicas(axonhub)
+	ready, reason, message := deploymentReadiness(deployment, r.desiredReplicas(axonhub))
 	condition := metav1.Condition{
 		Type:               AxonHubConditionReady,
 		Status:             metav1.ConditionFalse,
 		ObservedGeneration: axonhub.Generation,
-		Reason:             ReasonDeploymentNotReady,
-		Message:            "AxonHub deployment is not yet ready",
+		Reason:             reason,
+		Message:            message,
 	}
 	if ready {
 		condition.Status = metav1.ConditionTrue
 		condition.Reason = ReasonDeploymentReady
-		condition.Message = "AxonHub deployment is ready"
+		condition.Message = "AxonHub deployment is available"
 	}
 	meta.SetStatusCondition(&status.Conditions, condition)
 
@@ -295,6 +300,75 @@ func (r *AxonHubReconciler) updateStatus(ctx context.Context, axonhub *axonhubv1
 		axonhub.Status = status
 		if err := r.Status().Update(ctx, axonhub); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// deploymentReadiness reports whether the Deployment has finished rolling
+// out and is serving the desired replica count.
+//
+// Checking only ReadyReplicas >= desired is not sufficient: during a rolling
+// update with surge pods the ready count can reach the desired value while
+// old pods are still terminating and the rollout is in progress. The
+// Available condition alone is not sufficient either: it stays True
+// mid-rollout to preserve minimum availability, and ObservedGeneration is
+// set as soon as the Deployment controller observes the new spec, not when
+// the rollout completes. Therefore readiness requires all of: the latest
+// generation observed, Available=True, ReadyReplicas >= desired, and
+// UpdatedReplicas >= desired (all replicas running the current template).
+func deploymentReadiness(deployment *appsv1.Deployment, desiredReplicas int32) (bool, string, string) {
+	if deployment.Status.ObservedGeneration == 0 {
+		return false, ReasonDeploymentStatusNotObservedYet, "Deployment status has not been observed yet"
+	}
+	if deployment.Status.ObservedGeneration < deployment.Generation {
+		return false, ReasonDeploymentGenerationStale,
+			fmt.Sprintf("Deployment controller has not observed generation %d yet", deployment.Generation)
+	}
+
+	available := findDeploymentCondition(deployment.Status.Conditions, appsv1.DeploymentAvailable)
+
+	// Note on precedence: when the Available condition is False, that is
+	// reported even if the ready replica count is also below the desired
+	// value; the Deployment controller's own condition is the more
+	// actionable signal.
+	if available != nil && available.Status == corev1.ConditionFalse {
+		return false, ReasonDeploymentUnavailable,
+			fmt.Sprintf("Deployment Available condition is False: %s", available.Message)
+	}
+
+	if deployment.Status.ReadyReplicas < desiredReplicas {
+		return false, ReasonDeploymentReplicasNotReady,
+			fmt.Sprintf("Deployment has %d/%d ready replicas", deployment.Status.ReadyReplicas, desiredReplicas)
+	}
+
+	if deployment.Status.UpdatedReplicas < desiredReplicas {
+		// Mid rolling update: enough ready pods, but some still run the
+		// previous pod template (Available stays True to keep minimum
+		// availability). The rollout is not complete yet.
+		return false, ReasonDeploymentRolloutInProgress,
+			fmt.Sprintf("Deployment rollout in progress: %d/%d replicas updated to the current template",
+				deployment.Status.UpdatedReplicas, desiredReplicas)
+	}
+
+	if available == nil || available.Status != corev1.ConditionTrue {
+		// Replicas are ready but the Deployment controller has not (yet)
+		// published an Available condition (or published it as Unknown);
+		// treat the rollout as still in progress rather than reporting
+		// ready prematurely.
+		return false, ReasonDeploymentAvailableUnknown,
+			"Deployment Available condition is missing or not True yet"
+	}
+
+	return true, ReasonDeploymentReady, "AxonHub deployment is available"
+}
+
+// findDeploymentCondition returns the condition of the given type from the
+// Deployment's status conditions, or nil if it is not present.
+func findDeploymentCondition(conditions []appsv1.DeploymentCondition, condType appsv1.DeploymentConditionType) *appsv1.DeploymentCondition {
+	for i := range conditions {
+		if conditions[i].Type == condType {
+			return &conditions[i]
 		}
 	}
 	return nil
