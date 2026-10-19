@@ -39,6 +39,32 @@ spec:
           spec:
             description: AxonHubSpec defines the desired state of AxonHub.
             properties:
+              db:
+                description: |-
+                  DB configures the AxonHub database. When omitted, AxonHub's own
+                  defaults apply (SQLite with a local file, which is lost when the
+                  pod's filesystem is replaced).
+                properties:
+                  address:
+                    description: |-
+                      Address is the data source name (DSN) for the selected database
+                      type, e.g. "file:axonhub.db?cache=shared&_fk=1" for sqlite3 or
+                      "postgres://user:pass@host:5432/axonhub?sslmode=disable" for
+                      postgres.
+                    maxLength: 2048
+                    minLength: 1
+                    type: string
+                  type:
+                    description: Type is the database dialect AxonHub should use.
+                    enum:
+                    - sqlite3
+                    - postgres
+                    - mysql
+                    type: string
+                required:
+                - address
+                - type
+                type: object
               image:
                 default: looplj/axonhub:latest
                 description: Image is the AxonHub container image (repository[:tag]).
