@@ -76,18 +76,16 @@ var _ = Describe("AxonHub Controller", func() {
 			return deployment
 		}
 
-		// getAxonHub fetches the latest state of the AxonHub resource.
-		getAxonHub := func() *axonhubv1alpha1.AxonHub {
-			resource := &axonhubv1alpha1.AxonHub{}
-			Expect(k8sClient.Get(ctx, typeNamespacedName, resource)).To(Succeed())
-			return resource
-		}
-
-		// getResource fetches the latest state of the named AxonHub resource.
-		getResource := func(name types.NamespacedName) *axonhubv1alpha1.AxonHub {
+		// getAxonHubAt fetches the latest state of the named AxonHub resource.
+		getAxonHubAt := func(name types.NamespacedName) *axonhubv1alpha1.AxonHub {
 			resource := &axonhubv1alpha1.AxonHub{}
 			Expect(k8sClient.Get(ctx, name, resource)).To(Succeed())
 			return resource
+		}
+
+		// getAxonHub fetches the latest state of the resource under test.
+		getAxonHub := func() *axonhubv1alpha1.AxonHub {
+			return getAxonHubAt(typeNamespacedName)
 		}
 
 		// setDeploymentReadyReplicas simulates the deployment controller
@@ -368,6 +366,11 @@ var _ = Describe("AxonHub Controller", func() {
 			By("Emitting a warning Event on the AxonHub resource")
 			Eventually(recorder.Events).Should(Receive(ContainSubstring(ReasonChildObjectAlreadyOwned)))
 
+			By("Not re-emitting the Event while the conflict persists")
+			_, err = reconcileWithRecorder(recorder, namespacedName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(recorder.Events).ToNot(Receive())
+
 			By("Not having mutated the conflicting Deployment's owner references")
 			Expect(k8sClient.Get(ctx, namespacedName, conflictingDeployment)).To(Succeed())
 			Expect(conflictingDeployment.OwnerReferences).To(HaveLen(1))
@@ -420,7 +423,7 @@ var _ = Describe("AxonHub Controller", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(result.RequeueAfter).To(Equal(alreadyOwnedRequeueInterval))
 
-			ready := meta.FindStatusCondition(getResource(namespacedName).Status.Conditions, AxonHubConditionReady)
+			ready := meta.FindStatusCondition(getAxonHubAt(namespacedName).Status.Conditions, AxonHubConditionReady)
 			Expect(ready).NotTo(BeNil())
 			Expect(ready.Reason).To(Equal(ReasonChildObjectAlreadyOwned))
 			Expect(ready.Message).To(ContainSubstring("Service"))
@@ -438,7 +441,7 @@ var _ = Describe("AxonHub Controller", func() {
 			Expect(service.OwnerReferences[0].Kind).To(Equal("AxonHub"))
 			Expect(service.OwnerReferences[0].Name).To(Equal(conflictName))
 
-			ready = meta.FindStatusCondition(getResource(namespacedName).Status.Conditions, AxonHubConditionReady)
+			ready = meta.FindStatusCondition(getAxonHubAt(namespacedName).Status.Conditions, AxonHubConditionReady)
 			Expect(ready).NotTo(BeNil())
 			Expect(ready.Reason).To(Equal(ReasonDeploymentStatusNotObservedYet))
 		})

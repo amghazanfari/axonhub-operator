@@ -163,28 +163,38 @@ func (r *AxonHubReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	return ctrl.Result{}, nil
 }
 
+// setReadyCondition sets the Ready condition on the given (working copy of
+// the) status and persists it if the status changed. It returns whether the
+// status was updated, so callers can tie side effects (such as Events) to
+// condition transitions instead of re-firing them on every reconcile.
+func (r *AxonHubReconciler) setReadyCondition(ctx context.Context, axonhub *axonhubv1alpha1.AxonHub, status *axonhubv1alpha1.AxonHubStatus, condition metav1.Condition) (bool, error) {
+	status.ObservedGeneration = axonhub.Generation
+	meta.SetStatusCondition(&status.Conditions, condition)
+
+	if equality.Semantic.DeepEqual(axonhub.Status, *status) {
+		return false, nil
+	}
+	axonhub.Status = *status
+	if err := r.Status().Update(ctx, axonhub); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // reportReconcileFailure sets the Ready condition to False with a
 // ReconcileFailed reason, so reconcile errors that keep retrying (such as a
 // drifted owned Deployment) are visible on the status instead of silently
 // freezing it at stale values.
 func (r *AxonHubReconciler) reportReconcileFailure(ctx context.Context, axonhub *axonhubv1alpha1.AxonHub, reconcileErr error) error {
 	status := axonhub.DeepCopy().Status
-	status.ObservedGeneration = axonhub.Generation
-	meta.SetStatusCondition(&status.Conditions, metav1.Condition{
+	_, err := r.setReadyCondition(ctx, axonhub, &status, metav1.Condition{
 		Type:               AxonHubConditionReady,
 		Status:             metav1.ConditionFalse,
 		ObservedGeneration: axonhub.Generation,
 		Reason:             ReasonDeploymentReconcileFailed,
 		Message:            fmt.Sprintf("Reconciling the AxonHub deployment failed: %s", reconcileErr.Error()),
 	})
-
-	if !equality.Semantic.DeepEqual(axonhub.Status, status) {
-		axonhub.Status = status
-		if err := r.Status().Update(ctx, axonhub); err != nil {
-			return err
-		}
-	}
-	return nil
+	return err
 }
 
 // reportChildConflict surfaces an AlreadyOwned conflict — a pre-existing
@@ -193,7 +203,8 @@ func (r *AxonHubReconciler) reportReconcileFailure(ctx context.Context, axonhub 
 // warning Event, then schedules a periodic requeue instead of returning an
 // error, so the controller does not hot-retry. The conflict resolves itself
 // once the conflicting object is deleted or the AxonHub resource renamed;
-// the periodic requeue picks that up.
+// the periodic requeue picks that up. The warning Event is emitted only when
+// the condition transitions, not on every requeue, to avoid spamming.
 func (r *AxonHubReconciler) reportChildConflict(ctx context.Context, logger logr.Logger, axonhub *axonhubv1alpha1.AxonHub, kind string, conflict *controllerutil.AlreadyOwnedError) (ctrl.Result, error) {
 	message := fmt.Sprintf(
 		"%s %s/%s is already controlled by %s %q; delete the conflicting object or rename the AxonHub resource so it can be recreated",
@@ -202,24 +213,20 @@ func (r *AxonHubReconciler) reportChildConflict(ctx context.Context, logger logr
 	)
 
 	status := axonhub.DeepCopy().Status
-	status.ObservedGeneration = axonhub.Generation
-	meta.SetStatusCondition(&status.Conditions, metav1.Condition{
+	changed, err := r.setReadyCondition(ctx, axonhub, &status, metav1.Condition{
 		Type:               AxonHubConditionReady,
 		Status:             metav1.ConditionFalse,
 		ObservedGeneration: axonhub.Generation,
 		Reason:             ReasonChildObjectAlreadyOwned,
 		Message:            message,
 	})
-	if !equality.Semantic.DeepEqual(axonhub.Status, status) {
-		axonhub.Status = status
-		if err := r.Status().Update(ctx, axonhub); err != nil {
-			return ctrl.Result{}, fmt.Errorf("reporting ownership conflict on the AxonHub status: %w", err)
-		}
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("reporting ownership conflict on the AxonHub status: %w", err)
 	}
 
-	if r.Record != nil {
+	if changed && r.Record != nil {
 		r.Record.Eventf(axonhub, corev1.EventTypeWarning, ReasonChildObjectAlreadyOwned, "%s", message)
-	} else {
+	} else if r.Record == nil {
 		logger.Info("child object ownership conflict (no event recorder configured)", "message", message)
 	}
 
@@ -496,7 +503,6 @@ func labelsForAxonHub(name string) map[string]string {
 // AxonHub resource's status.
 func (r *AxonHubReconciler) updateStatus(ctx context.Context, axonhub *axonhubv1alpha1.AxonHub, deployment *appsv1.Deployment) error {
 	status := axonhub.DeepCopy().Status
-	status.ObservedGeneration = axonhub.Generation
 	status.ReadyReplicas = deployment.Status.ReadyReplicas
 
 	ready, reason, message := deploymentReadiness(deployment, r.desiredReplicas(axonhub))
@@ -512,15 +518,9 @@ func (r *AxonHubReconciler) updateStatus(ctx context.Context, axonhub *axonhubv1
 		condition.Reason = ReasonDeploymentReady
 		condition.Message = "AxonHub deployment is available"
 	}
-	meta.SetStatusCondition(&status.Conditions, condition)
 
-	if !equality.Semantic.DeepEqual(axonhub.Status, status) {
-		axonhub.Status = status
-		if err := r.Status().Update(ctx, axonhub); err != nil {
-			return err
-		}
-	}
-	return nil
+	_, err := r.setReadyCondition(ctx, axonhub, &status, condition)
+	return err
 }
 
 // deploymentReadiness reports whether the Deployment has finished rolling

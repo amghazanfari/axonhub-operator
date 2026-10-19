@@ -79,8 +79,9 @@ of failing the reconcile in a hot retry loop, the controller:
 - sets the `Ready` condition to `False` with reason
   `ChildObjectAlreadyOwned` and an actionable message ("delete the
   conflicting object or rename the AxonHub resource"),
-- emits a warning Event on the AxonHub resource (the reconciler holds an
-  event recorder; RBAC grants create/patch on events),
+- emits a warning Event on the AxonHub resource when the condition
+  transitions (not on every requeue; the reconciler holds an event recorder
+  and RBAC grants create/patch on events),
 - returns a periodic requeue (every 2 minutes) rather than an error, so the
   conflict is retried calmly and resolves automatically once the conflicting
   object is deleted or the resource renamed.
@@ -97,8 +98,10 @@ Current spec surface:
   variables
 
 Status surface: `observedGeneration`, `readyReplicas`, `conditions`
-(`Ready` = `DeploymentReady` / `DeploymentNotReady` / `ChildObjectAlreadyOwned`
-/ `DeploymentReconcileFailed`).
+(`Ready`; True reason `DeploymentReady`, False reasons include
+`DeploymentStatusNotObservedYet`, `DeploymentReplicasNotReady`,
+`DeploymentRolloutInProgress`, `ChildObjectAlreadyOwned`, and
+`DeploymentReconcileFailed`).
 
 ## RBAC
 
