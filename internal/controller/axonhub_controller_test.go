@@ -26,7 +26,9 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -74,11 +76,16 @@ var _ = Describe("AxonHub Controller", func() {
 			return deployment
 		}
 
-		// getAxonHub fetches the latest state of the AxonHub resource.
-		getAxonHub := func() *axonhubv1alpha1.AxonHub {
+		// getAxonHubAt fetches the latest state of the named AxonHub resource.
+		getAxonHubAt := func(name types.NamespacedName) *axonhubv1alpha1.AxonHub {
 			resource := &axonhubv1alpha1.AxonHub{}
-			Expect(k8sClient.Get(ctx, typeNamespacedName, resource)).To(Succeed())
+			Expect(k8sClient.Get(ctx, name, resource)).To(Succeed())
 			return resource
+		}
+
+		// getAxonHub fetches the latest state of the resource under test.
+		getAxonHub := func() *axonhubv1alpha1.AxonHub {
+			return getAxonHubAt(typeNamespacedName)
 		}
 
 		// setDeploymentReadyReplicas simulates the deployment controller
@@ -237,7 +244,7 @@ var _ = Describe("AxonHub Controller", func() {
 					Namespace: conflictName.Namespace,
 				},
 				Spec: corev1.ServiceSpec{
-					Selector: map[string]string{"app": "something-else"},
+					Selector: map[string]string{"workload": "something-else"},
 					Ports: []corev1.ServicePort{{
 						Port: 80,
 					}},
@@ -269,6 +276,204 @@ var _ = Describe("AxonHub Controller", func() {
 			})
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("conflicting immutable selector"))
+
+			By("Surfacing the service-stage failure on the Ready condition")
+			Expect(k8sClient.Get(ctx, conflictName, resource)).To(Succeed())
+			ready := meta.FindStatusCondition(resource.Status.Conditions, AxonHubConditionReady)
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+			Expect(ready.Reason).To(Equal(ReasonReconcileFailed))
+			Expect(ready.Message).To(ContainSubstring("service"))
+			Expect(ready.Message).To(ContainSubstring("conflicting immutable selector"))
+		})
+
+		// reconcileWithRecorder runs a single reconcile with a fake event
+		// recorder attached, so emitted Events can be asserted.
+		reconcileWithRecorder := func(recorder *record.FakeRecorder, name types.NamespacedName) (ctrl.Result, error) {
+			reconciler := &AxonHubReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+				Record: recorder,
+			}
+			return reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: name})
+		}
+
+		// foreignOwnerRef returns a controller owner reference pointing at
+		// an unrelated owner, simulating an object managed by someone else.
+		foreignOwnerRef := func(name string) metav1.OwnerReference {
+			return metav1.OwnerReference{
+				APIVersion: "axonhub.onrender.com/v1alpha1",
+				Kind:       "AxonHub",
+				Name:       name,
+				UID:        "11111111-2222-3333-4444-555555555555",
+				Controller: ptr.To(true),
+			}
+		}
+
+		It("should surface an AlreadyOwned Deployment conflict as a condition and event without erroring", func() {
+			const conflictName = "owned-deployment-resource"
+			namespacedName := types.NamespacedName{Name: conflictName, Namespace: testNamespace}
+
+			By("Creating a Deployment already controlled by another owner")
+			conflictingDeployment := &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      conflictName,
+					Namespace: testNamespace,
+					OwnerReferences: []metav1.OwnerReference{
+						foreignOwnerRef("some-other-owner"),
+					},
+				},
+				Spec: appsv1.DeploymentSpec{
+					Selector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{"app": "foreign"},
+					},
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{
+							Labels: map[string]string{"app": "foreign"},
+						},
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{{
+								Name:  axonhubContainerName,
+								Image: "nginx:1.27",
+							}},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, conflictingDeployment)).To(Succeed())
+
+			By("Creating an AxonHub resource with the same name")
+			resource := &axonhubv1alpha1.AxonHub{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      conflictName,
+					Namespace: testNamespace,
+				},
+			}
+			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+			defer func() {
+				Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+				Expect(k8sClient.Delete(ctx, conflictingDeployment)).To(Succeed())
+			}()
+
+			By("Reconciling and expecting a backed-off requeue instead of an error")
+			recorder := record.NewFakeRecorder(10)
+			result, err := reconcileWithRecorder(recorder, namespacedName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(alreadyOwnedRequeueInterval))
+
+			By("Surfacing the conflict as an actionable Ready condition")
+			Expect(k8sClient.Get(ctx, namespacedName, resource)).To(Succeed())
+			ready := meta.FindStatusCondition(resource.Status.Conditions, AxonHubConditionReady)
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+			Expect(ready.Reason).To(Equal(ReasonChildObjectAlreadyOwned))
+			Expect(ready.Message).To(ContainSubstring("Deployment"))
+			Expect(ready.Message).To(ContainSubstring("some-other-owner"))
+			Expect(ready.Message).To(ContainSubstring("delete the conflicting object or rename the AxonHub resource"))
+
+			By("Emitting a warning Event on the AxonHub resource")
+			Eventually(recorder.Events).Should(Receive(ContainSubstring(ReasonChildObjectAlreadyOwned)))
+
+			By("Not re-emitting the Event while the conflict persists")
+			_, err = reconcileWithRecorder(recorder, namespacedName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(recorder.Events).ToNot(Receive())
+
+			By("Not re-emitting the Event on an incidental status change (spec edit)")
+			resource.Spec.Replicas = ptr.To(int32(3))
+			Expect(k8sClient.Update(ctx, resource)).To(Succeed())
+			_, err = reconcileWithRecorder(recorder, namespacedName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(recorder.Events).ToNot(Receive())
+			ready = meta.FindStatusCondition(getAxonHubAt(namespacedName).Status.Conditions, AxonHubConditionReady)
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Reason).To(Equal(ReasonChildObjectAlreadyOwned))
+			Expect(ready.ObservedGeneration).To(Equal(getAxonHubAt(namespacedName).Generation))
+
+			By("Coping with a nil event recorder (no panic, condition still reported)")
+			nilRecorder := &AxonHubReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+			result, err = nilRecorder.Reconcile(ctx, reconcile.Request{NamespacedName: namespacedName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(alreadyOwnedRequeueInterval))
+			ready = meta.FindStatusCondition(getAxonHubAt(namespacedName).Status.Conditions, AxonHubConditionReady)
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Reason).To(Equal(ReasonChildObjectAlreadyOwned))
+
+			By("Not having mutated the conflicting Deployment's owner references")
+			Expect(k8sClient.Get(ctx, namespacedName, conflictingDeployment)).To(Succeed())
+			Expect(conflictingDeployment.OwnerReferences).To(HaveLen(1))
+			Expect(conflictingDeployment.OwnerReferences[0].Name).To(Equal("some-other-owner"))
+		})
+
+		It("should surface an AlreadyOwned Service conflict and recover once the object is removed", func() {
+			const conflictName = "owned-service-resource"
+			namespacedName := types.NamespacedName{Name: conflictName, Namespace: testNamespace}
+
+			By("Creating a Service already controlled by another owner")
+			conflictingService := &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      conflictName,
+					Namespace: testNamespace,
+					OwnerReferences: []metav1.OwnerReference{
+						foreignOwnerRef("some-other-owner"),
+					},
+				},
+				Spec: corev1.ServiceSpec{
+					Selector: labelsForAxonHub(conflictName),
+					Ports: []corev1.ServicePort{{
+						Port: 80,
+					}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, conflictingService)).To(Succeed())
+
+			By("Creating an AxonHub resource with the same name")
+			resource := &axonhubv1alpha1.AxonHub{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      conflictName,
+					Namespace: testNamespace,
+				},
+			}
+			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+
+			defer func() {
+				Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+				Expect(k8sClient.Delete(ctx, &appsv1.Deployment{
+					ObjectMeta: metav1.ObjectMeta{Name: conflictName, Namespace: testNamespace},
+				})).To(SatisfyAny(Succeed(), MatchError(ContainSubstring("not found"))))
+				service := &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: conflictName, Namespace: testNamespace}}
+				Expect(k8sClient.Delete(ctx, service)).To(SatisfyAny(Succeed(), MatchError(ContainSubstring("not found"))))
+			}()
+
+			By("Reconciling: the Deployment is created, the Service conflicts")
+			recorder := record.NewFakeRecorder(10)
+			result, err := reconcileWithRecorder(recorder, namespacedName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(alreadyOwnedRequeueInterval))
+
+			ready := meta.FindStatusCondition(getAxonHubAt(namespacedName).Status.Conditions, AxonHubConditionReady)
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Reason).To(Equal(ReasonChildObjectAlreadyOwned))
+			Expect(ready.Message).To(ContainSubstring("Service"))
+			Eventually(recorder.Events).Should(Receive(ContainSubstring(ReasonChildObjectAlreadyOwned)))
+
+			By("Deleting the conflicting Service and reconciling again recovers")
+			Expect(k8sClient.Delete(ctx, conflictingService)).To(Succeed())
+			result, err = reconcileWithRecorder(recorder, namespacedName)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(BeZero())
+			Expect(recorder.Events).ToNot(Receive())
+
+			service := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, namespacedName, service)).To(Succeed())
+			Expect(service.OwnerReferences).To(HaveLen(1))
+			Expect(service.OwnerReferences[0].Kind).To(Equal("AxonHub"))
+			Expect(service.OwnerReferences[0].Name).To(Equal(conflictName))
+
+			ready = meta.FindStatusCondition(getAxonHubAt(namespacedName).Status.Conditions, AxonHubConditionReady)
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Reason).To(Equal(ReasonDeploymentStatusNotObservedYet))
 		})
 		It("should configure the AxonHub database from spec.db", func() {
 			By("Reconciling the created resource without a db configured")
@@ -568,7 +773,7 @@ var _ = Describe("AxonHub Controller", func() {
 			ready := meta.FindStatusCondition(axonhub.Status.Conditions, "Ready")
 			Expect(ready).NotTo(BeNil())
 			Expect(ready.Status).To(Equal(metav1.ConditionFalse))
-			Expect(ready.Reason).To(Equal(ReasonDeploymentReconcileFailed))
+			Expect(ready.Reason).To(Equal(ReasonReconcileFailed))
 			Expect(ready.Message).To(ContainSubstring("no \"axonhub\" container"))
 
 			By("Not having mutated the drifted deployment")

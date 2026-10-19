@@ -205,6 +205,7 @@ func main() {
 	if err := (&controller.AxonHubReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
+		Record: mgr.GetEventRecorderFor("axonhub-operator"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "AxonHub")
 		os.Exit(1)

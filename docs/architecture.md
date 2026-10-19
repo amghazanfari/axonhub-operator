@@ -72,6 +72,22 @@ the managed pods fails the reconcile with a descriptive error, and an adopted
 Service of another type (NodePort/LoadBalancer) keeps its type since the API
 server forbids changing it back to ClusterIP.
 
+A pre-existing child object that is already **controlled by another
+controller** cannot be adopted (`controllerutil.AlreadyOwnedError`). Instead
+of failing the reconcile in a hot retry loop, the controller:
+
+- sets the `Ready` condition to `False` with reason
+  `ChildObjectAlreadyOwned` and an actionable message ("delete the
+  conflicting object or rename the AxonHub resource"),
+- emits a warning Event on the AxonHub resource when the condition
+  transitions (not on every requeue; the reconciler holds an event recorder
+  and RBAC grants create/patch on events),
+- returns a periodic requeue (every 2 minutes) rather than an error, so the
+  conflict is retried calmly and resolves automatically once the conflicting
+  object is deleted or the resource renamed. Since the conflicting object is
+  not owned by this controller, its deletion does not trigger a watch event,
+  so recovery can lag up to the full requeue interval.
+
 ## CRD API
 
 Current spec surface:
@@ -84,7 +100,10 @@ Current spec surface:
   variables
 
 Status surface: `observedGeneration`, `readyReplicas`, `conditions`
-(`Ready` = `DeploymentReady` / `DeploymentNotReady`).
+(`Ready`; True reason `DeploymentReady`, False reasons include
+`DeploymentStatusNotObservedYet`, `DeploymentReplicasNotReady`,
+`DeploymentRolloutInProgress`, `ChildObjectAlreadyOwned`, and the
+stage-neutral `ReconcileFailed` whose message names the failing stage).
 
 ## RBAC
 
@@ -95,6 +114,7 @@ generated into `config/rbac/`:
   `axonhubs/finalizers` (update)
 - `apps/deployments` (get/list/watch/create/update/patch)
 - core `services` (get/list/watch/create/update/patch)
+- core `events` (create/patch) for the warning Events described above
 
 Any new resource type the controller touches requires new markers followed by
 `make manifests`.
