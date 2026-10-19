@@ -37,12 +37,6 @@ rules:
 - apiGroups:
   - axonhub.onrender.com
   resources:
-  - axonhubs/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - axonhub.onrender.com
-  resources:
   - axonhubs/status
   verbs:
   - get

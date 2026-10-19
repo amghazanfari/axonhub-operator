@@ -72,6 +72,8 @@ type AxonHubStatus struct {
 	ReadyReplicas int32 `json:"readyReplicas,omitempty"`
 
 	// Conditions represent the latest available observations of the resource's state.
+	// +listType=map
+	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 

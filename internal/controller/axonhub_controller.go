@@ -25,13 +25,17 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+
+	"strings"
 
 	axonhubv1alpha1 "github.com/amghazanfari/axonhub-operator/api/v1alpha1"
 )
@@ -46,6 +50,10 @@ const (
 	// axonhubPortName is the name given to the HTTP port on both the
 	// container and the Service.
 	axonhubPortName = "http"
+
+	// mutableTagSuffix is the tag suffix (or absence of a tag) that marks an
+	// image reference as mutable, requiring an Always pull policy.
+	mutableTagSuffix = "latest"
 
 	// AxonHubConditionReady is the condition type reporting overall readiness.
 	AxonHubConditionReady = "Ready"
@@ -68,7 +76,6 @@ type AxonHubReconciler struct {
 
 // +kubebuilder:rbac:groups=axonhub.onrender.com,resources=axonhubs,verbs=get;list;watch
 // +kubebuilder:rbac:groups=axonhub.onrender.com,resources=axonhubs/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=axonhub.onrender.com,resources=axonhubs/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch
 
@@ -125,44 +132,45 @@ func (r *AxonHubReconciler) reconcileDeployment(ctx context.Context, axonhub *ax
 			return fmt.Errorf("setting controller reference: %w", err)
 		}
 
-		deployment.Labels = labelsForAxonHub(axonhub.Name)
+		// Merge our labels into any labels other actors may have set, so
+		// they are preserved instead of replaced wholesale.
+		if deployment.Labels == nil {
+			deployment.Labels = map[string]string{}
+		}
+		mergeLabels(deployment.Labels, labelsForAxonHub(axonhub.Name))
 		replicas := r.desiredReplicas(axonhub)
 		deployment.Spec.Replicas = &replicas
 
 		if deployment.CreationTimestamp.IsZero() {
 			// Create path: the selector is immutable, so it can only be
-			// set once; the full template is defined here.
+			// set once; the template skeleton is defined here.
 			deployment.Spec.Selector = &metav1.LabelSelector{
 				MatchLabels: labelsForAxonHub(axonhub.Name),
 			}
 			deployment.Spec.Template = corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: labelsForAxonHub(axonhub.Name),
+					Labels: map[string]string{},
 				},
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{{
-						Name:            axonhubContainerName,
-						Image:           axonhub.Spec.Image,
-						ImagePullPolicy: corev1.PullIfNotPresent,
-						Env:             dbEnvForAxonHub(axonhub),
-						Ports: []corev1.ContainerPort{{
-							Name:          axonhubPortName,
-							ContainerPort: axonhubContainerPort,
-							Protocol:      corev1.ProtocolTCP,
-						}},
+						Name: axonhubContainerName,
 					}},
 				},
 			}
-			return nil
 		}
+		if deployment.Spec.Template.Labels == nil {
+			deployment.Spec.Template.Labels = map[string]string{}
+		}
+		mergeLabels(deployment.Spec.Template.Labels, labelsForAxonHub(axonhub.Name))
 
-		// Update path: mutate only the fields derived from the spec.
-		deployment.Spec.Template.Labels = labelsForAxonHub(axonhub.Name)
-		for i := range deployment.Spec.Template.Spec.Containers {
-			if deployment.Spec.Template.Spec.Containers[i].Name == axonhubContainerName {
-				deployment.Spec.Template.Spec.Containers[i].Image = axonhub.Spec.Image
-				deployment.Spec.Template.Spec.Containers[i].Env = dbEnvForAxonHub(axonhub)
-			}
+		// Applied on every reconcile so drifted or adopted Deployments are
+		// also brought up to restricted-PSS-compatible defaults.
+		deployment.Spec.Template.Spec.SecurityContext = podSecurityContext()
+
+		// Both paths converge here: the axonhub container's spec is fully
+		// derived from the AxonHub resource on every reconcile.
+		if err := ensureAxonHubContainer(deployment, axonhub); err != nil {
+			return fmt.Errorf("ensuring axonhub container: %w", err)
 		}
 		return nil
 	})
@@ -253,6 +261,90 @@ func dbEnvForAxonHub(axonhub *axonhubv1alpha1.AxonHub) []corev1.EnvVar {
 	return []corev1.EnvVar{
 		{Name: "AXONHUB_DB_DIALECT", Value: axonhub.Spec.DB.Type},
 		{Name: "AXONHUB_DB_DSN", Value: axonhub.Spec.DB.Address},
+	}
+}
+
+// ensureAxonHubContainer reconciles the axonhub container of the Deployment's
+// pod template with the desired spec. The container must already exist: a
+// drifted or adopted Deployment without it cannot be reconciled silently.
+func ensureAxonHubContainer(deployment *appsv1.Deployment, axonhub *axonhubv1alpha1.AxonHub) error {
+	for i := range deployment.Spec.Template.Spec.Containers {
+		container := &deployment.Spec.Template.Spec.Containers[i]
+		if container.Name != axonhubContainerName {
+			continue
+		}
+		container.Image = axonhub.Spec.Image
+		container.ImagePullPolicy = pullPolicyFor(axonhub.Spec.Image)
+		container.Env = dbEnvForAxonHub(axonhub)
+		container.Ports = []corev1.ContainerPort{{
+			Name:          axonhubPortName,
+			ContainerPort: axonhubContainerPort,
+			Protocol:      corev1.ProtocolTCP,
+		}}
+		container.SecurityContext = containerSecurityContext()
+		container.Resources = corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("100m"),
+				corev1.ResourceMemory: resource.MustParse("128Mi"),
+			},
+		}
+		return nil
+	}
+	return fmt.Errorf("deployment %s/%s has no %q container; refusing to mutate a drifted or adopted Deployment",
+		deployment.Namespace, deployment.Name, axonhubContainerName)
+}
+
+// pullPolicyFor returns the image pull policy for the given image reference.
+// Mutable tags (":latest" or no tag at all) must always be pulled, otherwise
+// re-pushed images would never reach nodes that already cached the tag.
+// Digest references (img@sha256:...) and pinned tags are immutable, so
+// IfNotPresent is safe for them.
+func pullPolicyFor(image string) corev1.PullPolicy {
+	if strings.Contains(image, "@") {
+		return corev1.PullIfNotPresent
+	}
+	tag := image[strings.LastIndex(image, "/")+1:]
+	if i := strings.LastIndex(tag, ":"); i >= 0 {
+		tag = tag[i+1:]
+	} else {
+		tag = "" // no tag means :latest
+	}
+	if tag == mutableTagSuffix {
+		return corev1.PullAlways
+	}
+	return corev1.PullIfNotPresent
+}
+
+// podSecurityContext returns the pod-level security context, compatible with
+// the restricted Pod Security Standard.
+func podSecurityContext() *corev1.PodSecurityContext {
+	return &corev1.PodSecurityContext{
+		RunAsNonRoot: ptr.To(true),
+		SeccompProfile: &corev1.SeccompProfile{
+			Type: corev1.SeccompProfileTypeRuntimeDefault,
+		},
+	}
+}
+
+// containerSecurityContext returns the container-level security context,
+// compatible with the restricted Pod Security Standard.
+func containerSecurityContext() *corev1.SecurityContext {
+	return &corev1.SecurityContext{
+		AllowPrivilegeEscalation: ptr.To(false),
+		Capabilities: &corev1.Capabilities{
+			Drop: []corev1.Capability{"ALL"},
+		},
+		SeccompProfile: &corev1.SeccompProfile{
+			Type: corev1.SeccompProfileTypeRuntimeDefault,
+		},
+	}
+}
+
+// mergeLabels merges src into dst without removing keys already present in
+// dst that are not managed by the operator.
+func mergeLabels(dst, src map[string]string) {
+	for k, v := range src {
+		dst[k] = v
 	}
 }
 
