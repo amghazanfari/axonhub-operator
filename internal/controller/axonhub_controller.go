@@ -51,12 +51,13 @@ const (
 	AxonHubConditionReady = "Ready"
 
 	// Reasons explaining the Ready condition.
-	ReasonDeploymentReady            = "DeploymentReady"
-	ReasonDeploymentNotObservedYet   = "DeploymentStatusNotObservedYet"
-	ReasonDeploymentGenerationStale  = "DeploymentGenerationStale"
-	ReasonDeploymentUnavailable      = "DeploymentUnavailable"
-	ReasonDeploymentReplicasNotReady = "DeploymentReplicasNotReady"
-	ReasonDeploymentAvailableUnknown = "DeploymentAvailableUnknown"
+	ReasonDeploymentReady                = "DeploymentReady"
+	ReasonDeploymentStatusNotObservedYet = "DeploymentStatusNotObservedYet"
+	ReasonDeploymentGenerationStale      = "DeploymentGenerationStale"
+	ReasonDeploymentUnavailable          = "DeploymentUnavailable"
+	ReasonDeploymentReplicasNotReady     = "DeploymentReplicasNotReady"
+	ReasonDeploymentAvailableUnknown     = "DeploymentAvailableUnknown"
+	ReasonDeploymentRolloutInProgress    = "DeploymentRolloutInProgress"
 )
 
 // AxonHubReconciler reconciles a AxonHub object.
@@ -309,13 +310,16 @@ func (r *AxonHubReconciler) updateStatus(ctx context.Context, axonhub *axonhubv1
 //
 // Checking only ReadyReplicas >= desired is not sufficient: during a rolling
 // update with surge pods the ready count can reach the desired value while
-// old pods are still terminating and the rollout is in progress. Therefore
-// readiness additionally requires that the Deployment controller has
-// observed the latest generation and that the Deployment's Available
-// condition is True.
+// old pods are still terminating and the rollout is in progress. The
+// Available condition alone is not sufficient either: it stays True
+// mid-rollout to preserve minimum availability, and ObservedGeneration is
+// set as soon as the Deployment controller observes the new spec, not when
+// the rollout completes. Therefore readiness requires all of: the latest
+// generation observed, Available=True, ReadyReplicas >= desired, and
+// UpdatedReplicas >= desired (all replicas running the current template).
 func deploymentReadiness(deployment *appsv1.Deployment, desiredReplicas int32) (bool, string, string) {
 	if deployment.Status.ObservedGeneration == 0 {
-		return false, ReasonDeploymentNotObservedYet, "Deployment status has not been observed yet"
+		return false, ReasonDeploymentStatusNotObservedYet, "Deployment status has not been observed yet"
 	}
 	if deployment.Status.ObservedGeneration < deployment.Generation {
 		return false, ReasonDeploymentGenerationStale,
@@ -336,6 +340,15 @@ func deploymentReadiness(deployment *appsv1.Deployment, desiredReplicas int32) (
 	if deployment.Status.ReadyReplicas < desiredReplicas {
 		return false, ReasonDeploymentReplicasNotReady,
 			fmt.Sprintf("Deployment has %d/%d ready replicas", deployment.Status.ReadyReplicas, desiredReplicas)
+	}
+
+	if deployment.Status.UpdatedReplicas < desiredReplicas {
+		// Mid rolling update: enough ready pods, but some still run the
+		// previous pod template (Available stays True to keep minimum
+		// availability). The rollout is not complete yet.
+		return false, ReasonDeploymentRolloutInProgress,
+			fmt.Sprintf("Deployment rollout in progress: %d/%d replicas updated to the current template",
+				deployment.Status.UpdatedReplicas, desiredReplicas)
 	}
 
 	if available == nil || available.Status != corev1.ConditionTrue {

@@ -34,6 +34,10 @@ import (
 	axonhubv1alpha1 "github.com/amghazanfari/axonhub-operator/api/v1alpha1"
 )
 
+// deploymentAvailableReason is the reason the deployment controller uses
+// for a True Available condition once minimum availability is reached.
+const deploymentAvailableReason = "MinimumReplicasAvailable"
+
 var _ = Describe("AxonHub Controller", func() {
 	Context("When reconciling a resource", func() {
 		const resourceName = "test-resource"
@@ -79,17 +83,18 @@ var _ = Describe("AxonHub Controller", func() {
 
 		// setDeploymentReadyReplicas simulates the deployment controller
 		// having completed the rollout: the generation is observed, the
-		// given number of replicas is ready, and the Available condition
-		// is True.
+		// given number of replicas is ready and updated to the current
+		// template, and the Available condition is True.
 		setDeploymentReadyReplicas := func(ready int32) {
 			deployment := getDeployment()
 			deployment.Status.ObservedGeneration = deployment.Generation
 			deployment.Status.ReadyReplicas = ready
+			deployment.Status.UpdatedReplicas = ready
 			deployment.Status.Replicas = ready
 			deployment.Status.Conditions = []appsv1.DeploymentCondition{{
 				Type:               appsv1.DeploymentAvailable,
 				Status:             corev1.ConditionTrue,
-				Reason:             "MinimumReplicasAvailable",
+				Reason:             deploymentAvailableReason,
 				LastTransitionTime: metav1.Now(),
 			}}
 			Expect(k8sClient.Status().Update(ctx, deployment)).To(Succeed())
@@ -184,7 +189,7 @@ var _ = Describe("AxonHub Controller", func() {
 			Expect(axonhub.Status.ObservedGeneration).To(Equal(axonhub.Generation))
 			ready := meta.FindStatusCondition(axonhub.Status.Conditions, "Ready")
 			Expect(ready).NotTo(BeNil())
-			Expect(ready.Reason).To(Equal(ReasonDeploymentNotObservedYet))
+			Expect(ready.Reason).To(Equal(ReasonDeploymentStatusNotObservedYet))
 
 			By("Reconciling again to update the spec")
 			axonhub.Spec.Replicas = ptr.To(int32(3))
@@ -418,13 +423,37 @@ var _ = Describe("AxonHub Controller", func() {
 			ready := meta.FindStatusCondition(getAxonHub().Status.Conditions, AxonHubConditionReady)
 			Expect(ready).NotTo(BeNil())
 			Expect(ready.Status).To(Equal(metav1.ConditionFalse))
-			Expect(ready.Reason).To(Equal(ReasonDeploymentNotObservedYet))
+			Expect(ready.Reason).To(Equal(ReasonDeploymentStatusNotObservedYet))
+
+			By("Not reporting ready mid rolling update (old pods ready, not all updated)")
+			// The real mid-rollout state: the generation is observed,
+			// Available stays True to preserve minimum availability, and
+			// enough pods are ready — but only some run the new template.
+			setDeploymentStatus(func(status *appsv1.DeploymentStatus) {
+				status.ObservedGeneration = getDeployment().Generation
+				status.Replicas = 1
+				status.ReadyReplicas = 1
+				status.UpdatedReplicas = 0
+				status.Conditions = []appsv1.DeploymentCondition{{
+					Type:   appsv1.DeploymentAvailable,
+					Status: corev1.ConditionTrue,
+					Reason: deploymentAvailableReason,
+				}}
+			})
+			doReconcile()
+			ready = meta.FindStatusCondition(getAxonHub().Status.Conditions, AxonHubConditionReady)
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+			Expect(ready.Reason).To(Equal(ReasonDeploymentRolloutInProgress))
 
 			By("Not reporting ready during a surge (ready replicas reached, Available condition absent)")
 			setDeploymentStatus(func(status *appsv1.DeploymentStatus) {
 				status.ObservedGeneration = getDeployment().Generation
 				status.Replicas = 1
 				status.ReadyReplicas = 1
+				status.UpdatedReplicas = 1
+				// No Available condition published yet.
+				status.Conditions = nil
 			})
 			doReconcile()
 			ready = meta.FindStatusCondition(getAxonHub().Status.Conditions, AxonHubConditionReady)
@@ -473,7 +502,7 @@ var _ = Describe("AxonHub Controller", func() {
 				status.Conditions = []appsv1.DeploymentCondition{{
 					Type:   appsv1.DeploymentAvailable,
 					Status: corev1.ConditionTrue,
-					Reason: "MinimumReplicasAvailable",
+					Reason: deploymentAvailableReason,
 				}}
 			})
 			doReconcile()
