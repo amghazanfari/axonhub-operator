@@ -282,17 +282,16 @@ func (r *AxonHubReconciler) updateStatus(ctx context.Context, axonhub *axonhubv1
 	status.ReadyReplicas = deployment.Status.ReadyReplicas
 
 	ready, reason, message := deploymentReadiness(deployment, r.desiredReplicas(axonhub))
+	conditionStatus := metav1.ConditionFalse
+	if ready {
+		conditionStatus = metav1.ConditionTrue
+	}
 	condition := metav1.Condition{
 		Type:               AxonHubConditionReady,
-		Status:             metav1.ConditionFalse,
+		Status:             conditionStatus,
 		ObservedGeneration: axonhub.Generation,
 		Reason:             reason,
 		Message:            message,
-	}
-	if ready {
-		condition.Status = metav1.ConditionTrue
-		condition.Reason = ReasonDeploymentReady
-		condition.Message = "AxonHub deployment is available"
 	}
 	meta.SetStatusCondition(&status.Conditions, condition)
 

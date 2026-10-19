@@ -117,8 +117,9 @@ kubectl get axonhub my-axonhub -o yaml
 - `status.observedGeneration` — the generation most recently reconciled
 - `status.readyReplicas` — ready pods of the managed Deployment
 - `status.conditions` — includes a `Ready` condition
-  (`DeploymentReady` / `DeploymentNotReady`) following Kubernetes API
-  conventions
+  (`DeploymentReady`, or a granular not-ready reason such as
+  `DeploymentReplicasNotReady` / `DeploymentRolloutInProgress`) following
+  Kubernetes API conventions
 
 ```sh
 kubectl describe axonhub my-axonhub

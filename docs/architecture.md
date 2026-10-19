@@ -84,7 +84,10 @@ Current spec surface:
   variables
 
 Status surface: `observedGeneration`, `readyReplicas`, `conditions`
-(`Ready` = `DeploymentReady` / `DeploymentNotReady`).
+(`Ready` = `DeploymentReady`, or `DeploymentNotReady`-style granular reasons:
+`DeploymentStatusNotObservedYet`, `DeploymentGenerationStale`,
+`DeploymentUnavailable`, `DeploymentReplicasNotReady`,
+`DeploymentRolloutInProgress`, `DeploymentAvailableUnknown`).
 
 ## RBAC
 
