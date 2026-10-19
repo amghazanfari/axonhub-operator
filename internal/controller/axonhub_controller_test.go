@@ -276,6 +276,15 @@ var _ = Describe("AxonHub Controller", func() {
 			})
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("conflicting immutable selector"))
+
+			By("Surfacing the service-stage failure on the Ready condition")
+			Expect(k8sClient.Get(ctx, conflictName, resource)).To(Succeed())
+			ready := meta.FindStatusCondition(resource.Status.Conditions, AxonHubConditionReady)
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+			Expect(ready.Reason).To(Equal(ReasonReconcileFailed))
+			Expect(ready.Message).To(ContainSubstring("service"))
+			Expect(ready.Message).To(ContainSubstring("conflicting immutable selector"))
 		})
 
 		// reconcileWithRecorder runs a single reconcile with a fake event
@@ -764,7 +773,7 @@ var _ = Describe("AxonHub Controller", func() {
 			ready := meta.FindStatusCondition(axonhub.Status.Conditions, "Ready")
 			Expect(ready).NotTo(BeNil())
 			Expect(ready.Status).To(Equal(metav1.ConditionFalse))
-			Expect(ready.Reason).To(Equal(ReasonDeploymentReconcileFailed))
+			Expect(ready.Reason).To(Equal(ReasonReconcileFailed))
 			Expect(ready.Message).To(ContainSubstring("no \"axonhub\" container"))
 
 			By("Not having mutated the drifted deployment")

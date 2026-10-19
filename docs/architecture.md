@@ -102,8 +102,8 @@ Current spec surface:
 Status surface: `observedGeneration`, `readyReplicas`, `conditions`
 (`Ready`; True reason `DeploymentReady`, False reasons include
 `DeploymentStatusNotObservedYet`, `DeploymentReplicasNotReady`,
-`DeploymentRolloutInProgress`, `ChildObjectAlreadyOwned`, and
-`DeploymentReconcileFailed`).
+`DeploymentRolloutInProgress`, `ChildObjectAlreadyOwned`, and the
+stage-neutral `ReconcileFailed` whose message names the failing stage).
 
 ## RBAC
 

@@ -74,7 +74,12 @@ const (
 	ReasonDeploymentReplicasNotReady     = "DeploymentReplicasNotReady"
 	ReasonDeploymentAvailableUnknown     = "DeploymentAvailableUnknown"
 	ReasonDeploymentRolloutInProgress    = "DeploymentRolloutInProgress"
-	ReasonDeploymentReconcileFailed      = "DeploymentReconcileFailed"
+
+	// ReasonReconcileFailed reports a reconcile error that keeps retrying.
+	// It is stage-neutral (deployment or service) so tooling keyed on
+	// reasons is not misled by a Deployment-named reason on a Service
+	// failure; the message names the failing stage.
+	ReasonReconcileFailed = "ReconcileFailed"
 
 	// ReasonChildObjectAlreadyOwned reports that a pre-existing child object
 	// (Deployment or Service) with the same name as the AxonHub resource is
@@ -195,7 +200,7 @@ func (r *AxonHubReconciler) reportReconcileFailure(ctx context.Context, axonhub 
 		Type:               AxonHubConditionReady,
 		Status:             metav1.ConditionFalse,
 		ObservedGeneration: axonhub.Generation,
-		Reason:             ReasonDeploymentReconcileFailed,
+		Reason:             ReasonReconcileFailed,
 		Message:            fmt.Sprintf("Reconciling the AxonHub %s failed: %s", stage, reconcileErr.Error()),
 	})
 	return err
@@ -215,12 +220,16 @@ func (r *AxonHubReconciler) reportReconcileFailure(ctx context.Context, axonhub 
 // spamming.
 func (r *AxonHubReconciler) reportChildConflict(ctx context.Context, logger logr.Logger, axonhub *axonhubv1alpha1.AxonHub, kind string, conflict *controllerutil.AlreadyOwnedError) (ctrl.Result, error) {
 	message := fmt.Sprintf(
-		"%s %s/%s is already controlled by %s %q; delete the conflicting object or rename the AxonHub resource so it can be recreated",
+		"%s %s/%s is already controlled by %s %q (uid %s); delete the conflicting object or rename the AxonHub resource so it can be recreated",
 		kind, conflict.Object.GetNamespace(), conflict.Object.GetName(),
-		conflict.Owner.Kind, conflict.Owner.Name,
+		conflict.Owner.Kind, conflict.Owner.Name, conflict.Owner.UID,
 	)
 
 	status := axonhub.DeepCopy().Status
+	// The managed Deployment is not reconciled while the conflict persists,
+	// so any previously reported readyReplicas would be stale; zero it to
+	// keep the status coherent with Ready=False.
+	status.ReadyReplicas = 0
 	previous := meta.FindStatusCondition(status.Conditions, AxonHubConditionReady)
 	condition := metav1.Condition{
 		Type:               AxonHubConditionReady,
