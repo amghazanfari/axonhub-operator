@@ -78,11 +78,29 @@ var _ = Describe("AxonHub Controller", func() {
 		}
 
 		// setDeploymentReadyReplicas simulates the deployment controller
-		// reporting the given number of ready replicas.
+		// having completed the rollout: the generation is observed, the
+		// given number of replicas is ready, and the Available condition
+		// is True.
 		setDeploymentReadyReplicas := func(ready int32) {
 			deployment := getDeployment()
+			deployment.Status.ObservedGeneration = deployment.Generation
 			deployment.Status.ReadyReplicas = ready
 			deployment.Status.Replicas = ready
+			deployment.Status.Conditions = []appsv1.DeploymentCondition{{
+				Type:               appsv1.DeploymentAvailable,
+				Status:             corev1.ConditionTrue,
+				Reason:             "MinimumReplicasAvailable",
+				LastTransitionTime: metav1.Now(),
+			}}
+			Expect(k8sClient.Status().Update(ctx, deployment)).To(Succeed())
+		}
+
+		// setDeploymentStatus mutates the Deployment's status subresource
+		// with the given callback, simulating arbitrary deployment
+		// controller observations.
+		setDeploymentStatus := func(mutate func(*appsv1.DeploymentStatus)) {
+			deployment := getDeployment()
+			mutate(&deployment.Status)
 			Expect(k8sClient.Status().Update(ctx, deployment)).To(Succeed())
 		}
 
@@ -166,7 +184,7 @@ var _ = Describe("AxonHub Controller", func() {
 			Expect(axonhub.Status.ObservedGeneration).To(Equal(axonhub.Generation))
 			ready := meta.FindStatusCondition(axonhub.Status.Conditions, "Ready")
 			Expect(ready).NotTo(BeNil())
-			Expect(ready.Reason).To(Equal(ReasonDeploymentNotReady))
+			Expect(ready.Reason).To(Equal(ReasonDeploymentNotObservedYet))
 
 			By("Reconciling again to update the spec")
 			axonhub.Spec.Replicas = ptr.To(int32(3))
@@ -333,7 +351,7 @@ var _ = Describe("AxonHub Controller", func() {
 			ready = meta.FindStatusCondition(updated.Status.Conditions, AxonHubConditionReady)
 			Expect(ready).NotTo(BeNil())
 			Expect(ready.Status).To(Equal(metav1.ConditionFalse))
-			Expect(ready.Reason).To(Equal(ReasonDeploymentNotReady))
+			Expect(ready.Reason).To(Equal(ReasonDeploymentReplicasNotReady))
 		})
 
 		It("should scale the deployment down when replicas are lowered", func() {
@@ -390,6 +408,87 @@ var _ = Describe("AxonHub Controller", func() {
 			after := getAxonHub()
 			Expect(after.ResourceVersion).To(Equal(beforeResourceVersion))
 			Expect(after.Status).To(Equal(before.Status))
+		})
+
+		It("should not report ready while the rollout is still in progress", func() {
+			By("Reconciling the resource with the default replica count")
+			doReconcile()
+
+			By("Not reporting ready when the Deployment status is unobserved")
+			ready := meta.FindStatusCondition(getAxonHub().Status.Conditions, AxonHubConditionReady)
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+			Expect(ready.Reason).To(Equal(ReasonDeploymentNotObservedYet))
+
+			By("Not reporting ready during a surge (ready replicas reached, Available condition absent)")
+			setDeploymentStatus(func(status *appsv1.DeploymentStatus) {
+				status.ObservedGeneration = getDeployment().Generation
+				status.Replicas = 1
+				status.ReadyReplicas = 1
+			})
+			doReconcile()
+			ready = meta.FindStatusCondition(getAxonHub().Status.Conditions, AxonHubConditionReady)
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+			Expect(ready.Reason).To(Equal(ReasonDeploymentAvailableUnknown))
+
+			By("Not reporting ready when the Available condition is Unknown")
+			setDeploymentStatus(func(status *appsv1.DeploymentStatus) {
+				status.Conditions = []appsv1.DeploymentCondition{{
+					Type:   appsv1.DeploymentAvailable,
+					Status: corev1.ConditionUnknown,
+					Reason: "DeploymentConditionUnknown",
+				}}
+			})
+			doReconcile()
+			ready = meta.FindStatusCondition(getAxonHub().Status.Conditions, AxonHubConditionReady)
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+			Expect(ready.Reason).To(Equal(ReasonDeploymentAvailableUnknown))
+
+			By("Not reporting ready when the Available condition is False")
+			setDeploymentStatus(func(status *appsv1.DeploymentStatus) {
+				status.Conditions = []appsv1.DeploymentCondition{{
+					Type:   appsv1.DeploymentAvailable,
+					Status: corev1.ConditionFalse,
+					Reason: "MinimumReplicasUnavailable",
+				}}
+			})
+			doReconcile()
+			ready = meta.FindStatusCondition(getAxonHub().Status.Conditions, AxonHubConditionReady)
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+			Expect(ready.Reason).To(Equal(ReasonDeploymentUnavailable))
+
+			By("Not reporting ready when the Deployment generation is stale")
+			// Bump the Deployment's generation by mutating its spec so the
+			// stale-generation branch is distinct from the unobserved one.
+			deployment := getDeployment()
+			deployment.Spec.Template.Labels["test.axonhub.io/generation-bump"] = "true"
+			Expect(k8sClient.Update(ctx, deployment)).To(Succeed())
+			setDeploymentStatus(func(status *appsv1.DeploymentStatus) {
+				status.ObservedGeneration = getDeployment().Generation - 1
+				status.Replicas = 1
+				status.ReadyReplicas = 1
+				status.Conditions = []appsv1.DeploymentCondition{{
+					Type:   appsv1.DeploymentAvailable,
+					Status: corev1.ConditionTrue,
+					Reason: "MinimumReplicasAvailable",
+				}}
+			})
+			doReconcile()
+			ready = meta.FindStatusCondition(getAxonHub().Status.Conditions, AxonHubConditionReady)
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+			Expect(ready.Reason).To(Equal(ReasonDeploymentGenerationStale))
+
+			By("Reporting ready only once the rollout has completed")
+			setDeploymentReadyReplicas(1)
+			doReconcile()
+			ready = meta.FindStatusCondition(getAxonHub().Status.Conditions, AxonHubConditionReady)
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Status).To(Equal(metav1.ConditionTrue))
+			Expect(ready.Reason).To(Equal(ReasonDeploymentReady))
 		})
 	})
 })
