@@ -23,10 +23,30 @@ linters, or builds — CI already gates those. Only inspect.
 5. Compliance with the AGENTS.md rulebook.
 6. CRD design: defaults, validation markers, future extensibility.
 
-# Output format (this exact structure, in Markdown)
+# Output format
 
-- **VERDICT:** APPROVE / APPROVE WITH NITS / REQUEST CHANGES
-- **Findings:** a numbered list, max 10, most important first. Each item:
-  `severity (blocker/major/minor/nit) — file:line — one-line explanation`.
-- Be specific, not generic. If the change is clean, say so plainly instead of
-  inventing findings.
+Your ENTIRE final message must be a single JSON object and nothing else — no prose
+before or after, no Markdown. It will be parsed by a machine and rendered as a PR
+comment. Shape:
+
+{
+  "verdict": "APPROVE" | "APPROVE_WITH_NITS" | "REQUEST_CHANGES",
+  "summary": "one or two sentences describing the change and its overall quality",
+  "findings": [
+    {
+      "severity": "blocker" | "major" | "minor" | "nit",
+      "file": "path/to/file.go",
+      "line": 42,
+      "message": "one line, specific, says what is wrong and why it matters"
+    }
+  ]
+}
+
+Rules:
+- Keep `summary` under 300 characters. It is the headline of the review comment.
+- Maximum 10 findings, most important first. Use an empty array when clean.
+- Keep each `message` to a single line, under 200 characters.
+- Be specific, not generic. If the change is clean, say so plainly in the summary
+  instead of inventing findings.
+- Output valid JSON only. Escape newlines in strings. Do not wrap the JSON in
+  Markdown code fences.
