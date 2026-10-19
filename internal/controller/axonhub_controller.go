@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -34,8 +35,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-
-	"strings"
 
 	axonhubv1alpha1 "github.com/amghazanfari/axonhub-operator/api/v1alpha1"
 )
@@ -55,6 +54,11 @@ const (
 	// image reference as mutable, requiring an Always pull policy.
 	mutableTagSuffix = "latest"
 
+	// axonhubUID is the non-root UID/GID the AxonHub container runs as. The
+	// upstream image has no USER directive (root), so an explicit identity
+	// is required for restricted-PSS compliance.
+	axonhubUID = int64(1000)
+
 	// AxonHubConditionReady is the condition type reporting overall readiness.
 	AxonHubConditionReady = "Ready"
 
@@ -66,6 +70,7 @@ const (
 	ReasonDeploymentReplicasNotReady     = "DeploymentReplicasNotReady"
 	ReasonDeploymentAvailableUnknown     = "DeploymentAvailableUnknown"
 	ReasonDeploymentRolloutInProgress    = "DeploymentRolloutInProgress"
+	ReasonDeploymentReconcileFailed      = "DeploymentReconcileFailed"
 )
 
 // AxonHubReconciler reconciles a AxonHub object.
@@ -76,6 +81,12 @@ type AxonHubReconciler struct {
 
 // +kubebuilder:rbac:groups=axonhub.onrender.com,resources=axonhubs,verbs=get;list;watch
 // +kubebuilder:rbac:groups=axonhub.onrender.com,resources=axonhubs/status,verbs=get;update;patch
+// axonhubs/finalizers is not unused: SetControllerReference sets
+// blockOwnerDeletion on the child objects, and with
+// OwnerReferencesPermissionEnforcement enabled (e.g. OpenShift) creating or
+// updating owned children is forbidden without update permission on the
+// owner's finalizers subresource.
+// +kubebuilder:rbac:groups=axonhub.onrender.com,resources=axonhubs/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch
 
@@ -96,6 +107,13 @@ func (r *AxonHubReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	deployment, err := r.reconcileDeployment(ctx, &axonhub)
 	if err != nil {
+		// Surface the failure on the status before returning the error,
+		// so the Ready condition does not freeze at a stale value while
+		// the reconcile keeps retrying (e.g. a drifted Deployment that
+		// cannot be reconciled).
+		if statusErr := r.reportReconcileFailure(ctx, &axonhub, err); statusErr != nil {
+			log.Error(statusErr, "failed to report reconcile failure on the AxonHub status")
+		}
 		return ctrl.Result{}, err
 	}
 
@@ -110,13 +128,40 @@ func (r *AxonHubReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	return ctrl.Result{}, nil
 }
 
+// reportReconcileFailure sets the Ready condition to False with a
+// ReconcileFailed reason, so reconcile errors that keep retrying (such as a
+// drifted owned Deployment) are visible on the status instead of silently
+// freezing it at stale values.
+func (r *AxonHubReconciler) reportReconcileFailure(ctx context.Context, axonhub *axonhubv1alpha1.AxonHub, reconcileErr error) error {
+	status := axonhub.DeepCopy().Status
+	status.ObservedGeneration = axonhub.Generation
+	meta.SetStatusCondition(&status.Conditions, metav1.Condition{
+		Type:               AxonHubConditionReady,
+		Status:             metav1.ConditionFalse,
+		ObservedGeneration: axonhub.Generation,
+		Reason:             ReasonDeploymentReconcileFailed,
+		Message:            fmt.Sprintf("Reconciling the AxonHub deployment failed: %s", reconcileErr.Error()),
+	})
+
+	if !equality.Semantic.DeepEqual(axonhub.Status, status) {
+		axonhub.Status = status
+		if err := r.Status().Update(ctx, axonhub); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // reconcileDeployment ensures a Deployment owned by the AxonHub resource
 // exists and matches the desired spec.
 //
-// The mutate callback only assigns fields the operator owns. The full
-// pod template is set on creation only; on updates just the desired
-// replicas and image are mutated so that API-server-defaulted fields are
-// preserved and steady-state reconciles are true no-ops.
+// The mutate callback merges our labels into any existing ones and assigns
+// the fields the operator owns. The immutable pod-template selector is set
+// on creation only; the axonhub container's spec (image, pull policy, env,
+// ports, security context, resources) is fully derived from the AxonHub
+// resource on every reconcile, so drifted or adopted Deployments are
+// repaired. A Deployment without an axonhub container cannot be reconciled
+// and fails loudly instead of silently no-oping.
 func (r *AxonHubReconciler) reconcileDeployment(ctx context.Context, axonhub *axonhubv1alpha1.AxonHub) (*appsv1.Deployment, error) {
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -309,17 +354,23 @@ func pullPolicyFor(image string) corev1.PullPolicy {
 	} else {
 		tag = "" // no tag means :latest
 	}
-	if tag == mutableTagSuffix {
+	if tag == "" || tag == mutableTagSuffix {
 		return corev1.PullAlways
 	}
 	return corev1.PullIfNotPresent
 }
 
 // podSecurityContext returns the pod-level security context, compatible with
-// the restricted Pod Security Standard.
+// the restricted Pod Security Standard. The upstream looplj/axonhub image
+// does not declare a USER and defaults to root, so an explicit non-root
+// UID/GID is required for RunAsNonRoot to hold. fsGroup makes mounted PVCs
+// group-writable so AxonHub can persist its SQLite database.
 func podSecurityContext() *corev1.PodSecurityContext {
 	return &corev1.PodSecurityContext{
+		RunAsUser:    ptr.To[int64](axonhubUID),
+		RunAsGroup:   ptr.To[int64](axonhubUID),
 		RunAsNonRoot: ptr.To(true),
+		FSGroup:      ptr.To[int64](axonhubUID),
 		SeccompProfile: &corev1.SeccompProfile{
 			Type: corev1.SeccompProfileTypeRuntimeDefault,
 		},

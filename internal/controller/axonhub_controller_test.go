@@ -563,6 +563,14 @@ var _ = Describe("AxonHub Controller", func() {
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("no \"axonhub\" container"))
 
+			By("Surfacing the failure on the Ready condition instead of freezing status")
+			Expect(k8sClient.Get(ctx, typeNamespacedName, axonhub)).To(Succeed())
+			ready := meta.FindStatusCondition(axonhub.Status.Conditions, "Ready")
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+			Expect(ready.Reason).To(Equal(ReasonDeploymentReconcileFailed))
+			Expect(ready.Message).To(ContainSubstring("no \"axonhub\" container"))
+
 			By("Not having mutated the drifted deployment")
 			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
 			Expect(deployment.Spec.Template.Spec.Containers).To(HaveLen(1))
