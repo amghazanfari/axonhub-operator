@@ -58,6 +58,38 @@ spec:
 Both `spec.replicas` and `spec.image` are optional; the CRD applies sane
 defaults (`1` replica and `looplj/axonhub:latest`).
 
+### Database selection
+
+AxonHub supports the `sqlite3`, `postgres`, and `mysql` dialects. Configure
+which one to use — and its address (DSN) — with the `spec.db` dictionary:
+
+```yaml
+apiVersion: axonhub.onrender.com/v1alpha1
+kind: AxonHub
+metadata:
+  name: my-axonhub
+spec:
+  db:
+    type: postgres
+    address: postgres://user:pass@postgres.default.svc:5432/axonhub?sslmode=disable
+```
+
+`spec.db.type` is an enum (`sqlite3`, `postgres`, `mysql`) validated by the
+CRD; `spec.db.address` is the data source name for that database, e.g.
+`file:axonhub.db?cache=shared&_fk=1` for SQLite. The operator maps these to
+the `AXONHUB_DB_DIALECT` and `AXONHUB_DB_DSN` environment variables of the
+AxonHub container.
+
+When `spec.db` is omitted, no database environment is injected and AxonHub's
+own defaults apply (SQLite with a local file — note the data is lost when the
+pod's filesystem is replaced, so configure a database backed by a volume or a
+remote server for anything persistent).
+
+> **Note:** the address may contain credentials. It is stored in the
+> AxonHub resource like any other Kubernetes object; restrict access to the
+> CR (and consider a secret-reference field — not yet supported — for
+> stricter setups).
+
 The operator creates a Deployment named after the `AxonHub` resource in the
 same namespace, with one container (named `axonhub`) per pod that serves HTTP
 on port `8090`. It also creates a ClusterIP Service with the same name that

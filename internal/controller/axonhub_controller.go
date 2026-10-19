@@ -139,6 +139,7 @@ func (r *AxonHubReconciler) reconcileDeployment(ctx context.Context, axonhub *ax
 						Name:            axonhubContainerName,
 						Image:           axonhub.Spec.Image,
 						ImagePullPolicy: corev1.PullIfNotPresent,
+						Env:             dbEnvForAxonHub(axonhub),
 						Ports: []corev1.ContainerPort{{
 							Name:          axonhubPortName,
 							ContainerPort: axonhubContainerPort,
@@ -155,6 +156,7 @@ func (r *AxonHubReconciler) reconcileDeployment(ctx context.Context, axonhub *ax
 		for i := range deployment.Spec.Template.Spec.Containers {
 			if deployment.Spec.Template.Spec.Containers[i].Name == axonhubContainerName {
 				deployment.Spec.Template.Spec.Containers[i].Image = axonhub.Spec.Image
+				deployment.Spec.Template.Spec.Containers[i].Env = dbEnvForAxonHub(axonhub)
 			}
 		}
 		return nil
@@ -234,6 +236,19 @@ func (r *AxonHubReconciler) reconcileService(ctx context.Context, axonhub *axonh
 		return fmt.Errorf("ensuring service: %w", err)
 	}
 	return nil
+}
+
+// dbEnvForAxonHub returns the container environment variables configuring
+// the AxonHub database, derived from spec.db. A nil DB returns nil so
+// AxonHub's own defaults apply.
+func dbEnvForAxonHub(axonhub *axonhubv1alpha1.AxonHub) []corev1.EnvVar {
+	if axonhub.Spec.DB == nil {
+		return nil
+	}
+	return []corev1.EnvVar{
+		{Name: "AXONHUB_DB_DIALECT", Value: axonhub.Spec.DB.Type},
+		{Name: "AXONHUB_DB_DSN", Value: axonhub.Spec.DB.Address},
+	}
 }
 
 // desiredReplicas returns the effective replica count for the resource.

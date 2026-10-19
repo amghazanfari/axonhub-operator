@@ -5,3 +5,8 @@ metadata:
 spec:
   # image intentionally omitted to demonstrate the CRD default (looplj/axonhub:latest)
   replicas: 2
+  # db intentionally omitted to demonstrate the AxonHub default (SQLite);
+  # configure it to select a supported dialect and its DSN, e.g.:
+  # db:
+  #   type: postgres
+  #   address: postgres://user:pass@postgres.default.svc:5432/axonhub?sslmode=disable

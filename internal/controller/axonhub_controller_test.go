@@ -180,5 +180,76 @@ var _ = Describe("AxonHub Controller", func() {
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("conflicting immutable selector"))
 		})
+		It("should configure the AxonHub database from spec.db", func() {
+			By("Reconciling the created resource without a db configured")
+			controllerReconciler := &AxonHubReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Leaving the database env unset so AxonHub defaults apply")
+			deployment := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+			Expect(deployment.Spec.Template.Spec.Containers[0].Env).To(BeEmpty())
+
+			By("Configuring a postgres database")
+			Expect(k8sClient.Get(ctx, typeNamespacedName, axonhub)).To(Succeed())
+			axonhub.Spec.DB = &axonhubv1alpha1.DatabaseSpec{
+				Type:    "postgres",
+				Address: "postgres://user:pass@postgres:5432/axonhub?sslmode=disable",
+			}
+			Expect(k8sClient.Update(ctx, axonhub)).To(Succeed())
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Injecting the AXONHUB_DB_* environment variables")
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+			env := deployment.Spec.Template.Spec.Containers[0].Env
+			Expect(env).To(HaveLen(2))
+			Expect(env).To(ContainElement(corev1.EnvVar{Name: "AXONHUB_DB_DIALECT", Value: "postgres"}))
+			Expect(env).To(ContainElement(corev1.EnvVar{Name: "AXONHUB_DB_DSN", Value: "postgres://user:pass@postgres:5432/axonhub?sslmode=disable"}))
+
+			By("Switching to mysql updates the injected variables")
+			Expect(k8sClient.Get(ctx, typeNamespacedName, axonhub)).To(Succeed())
+			axonhub.Spec.DB = &axonhubv1alpha1.DatabaseSpec{
+				Type:    "mysql",
+				Address: "mysql://user:pass@mysql:3306/axonhub",
+			}
+			Expect(k8sClient.Update(ctx, axonhub)).To(Succeed())
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+			env = deployment.Spec.Template.Spec.Containers[0].Env
+			Expect(env).To(HaveLen(2))
+			Expect(env).To(ContainElement(corev1.EnvVar{Name: "AXONHUB_DB_DIALECT", Value: "mysql"}))
+			Expect(env).To(ContainElement(corev1.EnvVar{Name: "AXONHUB_DB_DSN", Value: "mysql://user:pass@mysql:3306/axonhub"}))
+		})
+
+		It("should reject unsupported database types", func() {
+			By("Creating an AxonHub resource with an invalid db type")
+			resource := &axonhubv1alpha1.AxonHub{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "invalid-db-type",
+					Namespace: testNamespace,
+				},
+				Spec: axonhubv1alpha1.AxonHubSpec{
+					DB: &axonhubv1alpha1.DatabaseSpec{
+						Type:    "oracle",
+						Address: "oracle://localhost:1521/xe",
+					},
+				},
+			}
+			err := k8sClient.Create(ctx, resource)
+			Expect(err).To(HaveOccurred())
+			Expect(errors.IsInvalid(err)).To(BeTrue())
+		})
 	})
 })

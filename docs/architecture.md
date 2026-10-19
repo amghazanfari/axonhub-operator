@@ -59,7 +59,9 @@ after the CR:
   - labels: `app.kubernetes.io/name=axonhub`,
     `app.kubernetes.io/instance=<CR name>`,
     `app.kubernetes.io/managed-by=axonhub-operator`
-  - a single `axonhub` container from `spec.image`, HTTP port `8090`
+  - a single `axonhub` container from `spec.image`, HTTP port `8090`, with
+    the `AXONHUB_DB_DIALECT` / `AXONHUB_DB_DSN` environment variables set
+    when `spec.db` is configured
 - a **ClusterIP Service** selecting those pods, exposing TCP port `8090`
   (`http` → target port `http`)
 
@@ -76,6 +78,10 @@ Current spec surface:
 
 - `spec.replicas` (`*int32`, minimum 1, default 1)
 - `spec.image` (string, default `looplj/axonhub:latest`)
+- `spec.db` (optional `DatabaseSpec`): `type` enum (`sqlite3`, `postgres`,
+  `mysql` — the dialects AxonHub supports) and `address` (the DSN), mapped
+  to the `AXONHUB_DB_DIALECT` / `AXONHUB_DB_DSN` container environment
+  variables
 
 Status surface: `observedGeneration`, `readyReplicas`, `conditions`
 (`Ready` = `DeploymentReady` / `DeploymentNotReady`).
