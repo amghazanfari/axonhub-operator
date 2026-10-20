@@ -49,6 +49,8 @@ type AxonHubSpec struct {
 // DatabaseSpec selects which of the AxonHub-supported databases to use and
 // how to reach it. It maps to the AXONHUB_DB_DIALECT and AXONHUB_DB_DSN
 // environment variables of the AxonHub container.
+// Exactly one of Address and AddressSecret must be set.
+// +kubebuilder:validation:XValidation:rule="(has(self.address) && !has(self.addressSecret)) || (!has(self.address) && has(self.addressSecret))",message="exactly one of address or addressSecret must be set"
 type DatabaseSpec struct {
 	// Type is the database dialect AxonHub should use.
 	// +kubebuilder:validation:Enum=sqlite3;postgres;mysql
@@ -56,11 +58,35 @@ type DatabaseSpec struct {
 
 	// Address is the data source name (DSN) for the selected database
 	// type, e.g. "file:axonhub.db?cache=shared&_fk=1" for sqlite3 or
-	// "postgres://user:pass@host:5432/axonhub?sslmode=disable" for
-	// postgres.
+	// "postgres://host:5432/axonhub?sslmode=disable" for postgres.
+	// Use AddressSecret instead when the DSN contains credentials, so they
+	// are not stored in the AxonHub resource.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=2048
-	Address string `json:"address"`
+	Address string `json:"address,omitempty"`
+
+	// AddressSecret references a key in a Secret in the AxonHub resource's
+	// namespace whose value is the data source name (DSN) for the selected
+	// database type. The controller injects it through an
+	// env.valueFrom.secretKeyRef, so the credentials never live in the
+	// AxonHub resource. Mutually exclusive with Address.
+	AddressSecret *SecretKeySelector `json:"addressSecret,omitempty"`
+}
+
+// SecretKeySelector selects a key of a Secret in the same namespace as the
+// AxonHub resource.
+type SecretKeySelector struct {
+	// Name is the name of the Secret.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern="^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+	Name string `json:"name"`
+
+	// Key is the key within the Secret whose value is the DSN.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern="^[-._a-zA-Z0-9]+$"
+	Key string `json:"key"`
 }
 
 // AxonHubStatus defines the observed state of AxonHub.

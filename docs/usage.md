@@ -61,7 +61,9 @@ defaults (`1` replica and `looplj/axonhub:latest`).
 ### Database selection
 
 AxonHub supports the `sqlite3`, `postgres`, and `mysql` dialects. Configure
-which one to use — and its address (DSN) — with the `spec.db` dictionary:
+which one to use — and how to reach it — with the `spec.db` dictionary.
+
+For a credential-free DSN, set `spec.db.address`:
 
 ```yaml
 apiVersion: axonhub.onrender.com/v1alpha1
@@ -71,24 +73,52 @@ metadata:
 spec:
   db:
     type: postgres
-    address: postgres://user:pass@postgres.default.svc:5432/axonhub?sslmode=disable
+    address: postgres://postgres.default.svc:5432/axonhub?sslmode=disable
+```
+
+For a DSN that contains credentials, keep it in a `Secret` in the same
+namespace as the `AxonHub` resource and reference it with
+`spec.db.addressSecret` (a `name`/`key` pair) instead:
+
+```sh
+kubectl create secret generic axonhub-db \
+  --from-literal=dsn='postgres://user:pass@postgres.default.svc:5432/axonhub?sslmode=disable'
+```
+
+```yaml
+apiVersion: axonhub.onrender.com/v1alpha1
+kind: AxonHub
+metadata:
+  name: my-axonhub
+spec:
+  db:
+    type: postgres
+    addressSecret:
+      name: axonhub-db
+      key: dsn
 ```
 
 `spec.db.type` is an enum (`sqlite3`, `postgres`, `mysql`) validated by the
 CRD; `spec.db.address` is the data source name for that database, e.g.
-`file:axonhub.db?cache=shared&_fk=1` for SQLite. The operator maps these to
-the `AXONHUB_DB_DIALECT` and `AXONHUB_DB_DSN` environment variables of the
-AxonHub container.
+`file:axonhub.db?cache=shared&_fk=1` for SQLite. Exactly one of `address` and
+`addressSecret` must be set (the CRD rejects a `spec.db` that sets neither or
+both). The operator maps these to the `AXONHUB_DB_DIALECT` and
+`AXONHUB_DB_DSN` environment variables of the AxonHub container; with
+`addressSecret` the DSN is injected via `env.valueFrom.secretKeyRef`, so it
+never appears in the `AxonHub` resource.
 
 When `spec.db` is omitted, no database environment is injected and AxonHub's
 own defaults apply (SQLite with a local file — note the data is lost when the
 pod's filesystem is replaced, so configure a database backed by a volume or a
 remote server for anything persistent).
 
-> **Note:** the address may contain credentials. It is stored in the
-> AxonHub resource like any other Kubernetes object; restrict access to the
-> CR (and consider a secret-reference field — not yet supported — for
-> stricter setups).
+> **Note:** the operator does not read the referenced `Secret`, so it does not
+> have to exist when the `AxonHub` resource is created; the kubelet resolves
+> it when starting the pod, and a missing `Secret` or key surfaces as a pod
+> `CreateContainerConfigError`. Environment variables are resolved once at
+> pod start, so after rotating the `Secret` you must restart the pods (for
+> example `kubectl rollout restart deployment/my-axonhub`) to pick up the new
+> DSN.
 
 The operator creates a Deployment named after the `AxonHub` resource in the
 same namespace, with one container (named `axonhub`) per pod that serves HTTP

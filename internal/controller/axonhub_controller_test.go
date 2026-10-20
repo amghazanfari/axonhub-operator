@@ -40,6 +40,15 @@ import (
 // for a True Available condition once minimum availability is reached.
 const deploymentAvailableReason = "MinimumReplicasAvailable"
 
+// Shared test values for the database environment assertions.
+const (
+	testDBDialect    = "postgres"
+	testDBDialectEnv = "AXONHUB_DB_DIALECT"
+	testDBDSNEnv     = "AXONHUB_DB_DSN"
+	testDBSecretName = "axonhub-db"
+	testDBSecretKey  = "dsn"
+)
+
 var _ = Describe("AxonHub Controller", func() {
 	Context("When reconciling a resource", func() {
 		const resourceName = "test-resource"
@@ -494,7 +503,7 @@ var _ = Describe("AxonHub Controller", func() {
 			By("Configuring a postgres database")
 			Expect(k8sClient.Get(ctx, typeNamespacedName, axonhub)).To(Succeed())
 			axonhub.Spec.DB = &axonhubv1alpha1.DatabaseSpec{
-				Type:    "postgres",
+				Type:    testDBDialect,
 				Address: "postgres://user:pass@postgres:5432/axonhub?sslmode=disable",
 			}
 			Expect(k8sClient.Update(ctx, axonhub)).To(Succeed())
@@ -507,8 +516,8 @@ var _ = Describe("AxonHub Controller", func() {
 			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
 			env := deployment.Spec.Template.Spec.Containers[0].Env
 			Expect(env).To(HaveLen(2))
-			Expect(env).To(ContainElement(corev1.EnvVar{Name: "AXONHUB_DB_DIALECT", Value: "postgres"}))
-			Expect(env).To(ContainElement(corev1.EnvVar{Name: "AXONHUB_DB_DSN", Value: "postgres://user:pass@postgres:5432/axonhub?sslmode=disable"}))
+			Expect(env).To(ContainElement(corev1.EnvVar{Name: testDBDialectEnv, Value: testDBDialect}))
+			Expect(env).To(ContainElement(corev1.EnvVar{Name: testDBDSNEnv, Value: "postgres://user:pass@postgres:5432/axonhub?sslmode=disable"}))
 
 			By("Switching to mysql updates the injected variables")
 			Expect(k8sClient.Get(ctx, typeNamespacedName, axonhub)).To(Succeed())
@@ -524,8 +533,60 @@ var _ = Describe("AxonHub Controller", func() {
 			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
 			env = deployment.Spec.Template.Spec.Containers[0].Env
 			Expect(env).To(HaveLen(2))
-			Expect(env).To(ContainElement(corev1.EnvVar{Name: "AXONHUB_DB_DIALECT", Value: "mysql"}))
-			Expect(env).To(ContainElement(corev1.EnvVar{Name: "AXONHUB_DB_DSN", Value: "mysql://user:pass@mysql:3306/axonhub"}))
+			Expect(env).To(ContainElement(corev1.EnvVar{Name: testDBDialectEnv, Value: "mysql"}))
+			Expect(env).To(ContainElement(corev1.EnvVar{Name: testDBDSNEnv, Value: "mysql://user:pass@mysql:3306/axonhub"}))
+
+			By("Referencing the DSN from a Secret instead of the spec")
+			Expect(k8sClient.Get(ctx, typeNamespacedName, axonhub)).To(Succeed())
+			axonhub.Spec.DB = &axonhubv1alpha1.DatabaseSpec{
+				Type: testDBDialect,
+				AddressSecret: &axonhubv1alpha1.SecretKeySelector{
+					Name: testDBSecretName,
+					Key:  testDBSecretKey,
+				},
+			}
+			Expect(k8sClient.Update(ctx, axonhub)).To(Succeed())
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Injecting AXONHUB_DB_DSN as an env.valueFrom.secretKeyRef")
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+			env = deployment.Spec.Template.Spec.Containers[0].Env
+			Expect(env).To(HaveLen(2))
+			Expect(env).To(ContainElement(corev1.EnvVar{Name: testDBDialectEnv, Value: testDBDialect}))
+			Expect(env).To(ContainElement(corev1.EnvVar{
+				Name: testDBDSNEnv,
+				ValueFrom: &corev1.EnvVarSource{
+					SecretKeyRef: &corev1.SecretKeySelector{
+						LocalObjectReference: corev1.LocalObjectReference{Name: testDBSecretName},
+						Key:                  testDBSecretKey,
+					},
+				},
+			}))
+
+			By("Switching back to a literal address clears the secret reference")
+			Expect(k8sClient.Get(ctx, typeNamespacedName, axonhub)).To(Succeed())
+			axonhub.Spec.DB = &axonhubv1alpha1.DatabaseSpec{
+				Type:    "sqlite3",
+				Address: "file:axonhub.db?cache=shared&_fk=1",
+			}
+			Expect(k8sClient.Update(ctx, axonhub)).To(Succeed())
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Get(ctx, typeNamespacedName, deployment)).To(Succeed())
+			env = deployment.Spec.Template.Spec.Containers[0].Env
+			Expect(env).To(HaveLen(2))
+			Expect(env).To(ContainElement(corev1.EnvVar{Name: testDBDialectEnv, Value: "sqlite3"}))
+			Expect(env).To(ContainElement(corev1.EnvVar{Name: testDBDSNEnv, Value: "file:axonhub.db?cache=shared&_fk=1"}))
+
+			By("Resetting the shared fixture so the database config does not leak into later specs")
+			Expect(k8sClient.Get(ctx, typeNamespacedName, axonhub)).To(Succeed())
+			axonhub.Spec.DB = nil
+			Expect(k8sClient.Update(ctx, axonhub)).To(Succeed())
 		})
 
 		It("should reject unsupported database types", func() {
@@ -545,6 +606,71 @@ var _ = Describe("AxonHub Controller", func() {
 			err := k8sClient.Create(ctx, resource)
 			Expect(err).To(HaveOccurred())
 			Expect(errors.IsInvalid(err)).To(BeTrue())
+		})
+
+		It("should require exactly one of address or addressSecret", func() {
+			By("Rejecting a db spec with neither a literal address nor a secret reference")
+			resource := &axonhubv1alpha1.AxonHub{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "missing-db-dsn",
+					Namespace: testNamespace,
+				},
+				Spec: axonhubv1alpha1.AxonHubSpec{
+					DB: &axonhubv1alpha1.DatabaseSpec{Type: testDBDialect},
+				},
+			}
+			err := k8sClient.Create(ctx, resource)
+			Expect(err).To(HaveOccurred())
+			Expect(errors.IsInvalid(err)).To(BeTrue())
+			Expect(err.Error()).To(ContainSubstring("exactly one of address or addressSecret must be set"))
+
+			By("Rejecting a db spec that sets both")
+			resource.Name = "ambiguous-db-dsn"
+			resource.Spec.DB = &axonhubv1alpha1.DatabaseSpec{
+				Type:          testDBDialect,
+				Address:       "postgres://postgres:5432/axonhub",
+				AddressSecret: &axonhubv1alpha1.SecretKeySelector{Name: testDBSecretName, Key: testDBSecretKey},
+			}
+			err = k8sClient.Create(ctx, resource)
+			Expect(err).To(HaveOccurred())
+			Expect(errors.IsInvalid(err)).To(BeTrue())
+			Expect(err.Error()).To(ContainSubstring("exactly one of address or addressSecret must be set"))
+		})
+
+		It("should enforce the address/addressSecret exclusivity on update", func() {
+			By("Creating a resource with a literal address")
+			resource := &axonhubv1alpha1.AxonHub{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "updated-db-dsn",
+					Namespace: testNamespace,
+				},
+				Spec: axonhubv1alpha1.AxonHubSpec{
+					DB: &axonhubv1alpha1.DatabaseSpec{
+						Type:    testDBDialect,
+						Address: "postgres://postgres:5432/axonhub",
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, resource)).To(Succeed())
+			defer func() {
+				Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
+			}()
+
+			By("Rejecting an update that adds addressSecret while address is still set")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: resource.Name, Namespace: testNamespace}, resource)).To(Succeed())
+			resource.Spec.DB.AddressSecret = &axonhubv1alpha1.SecretKeySelector{Name: testDBSecretName, Key: testDBSecretKey}
+			err := k8sClient.Update(ctx, resource)
+			Expect(err).To(HaveOccurred())
+			Expect(errors.IsInvalid(err)).To(BeTrue())
+			Expect(err.Error()).To(ContainSubstring("exactly one of address or addressSecret must be set"))
+
+			By("Accepting an update that replaces address with addressSecret")
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: resource.Name, Namespace: testNamespace}, resource)).To(Succeed())
+			resource.Spec.DB = &axonhubv1alpha1.DatabaseSpec{
+				Type:          testDBDialect,
+				AddressSecret: &axonhubv1alpha1.SecretKeySelector{Name: testDBSecretName, Key: testDBSecretKey},
+			}
+			Expect(k8sClient.Update(ctx, resource)).To(Succeed())
 		})
 
 		It("should report Ready=True when the deployment has enough ready replicas", func() {

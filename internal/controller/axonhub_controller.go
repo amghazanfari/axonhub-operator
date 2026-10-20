@@ -409,13 +409,33 @@ func (r *AxonHubReconciler) reconcileService(ctx context.Context, axonhub *axonh
 // dbEnvForAxonHub returns the container environment variables configuring
 // the AxonHub database, derived from spec.db. A nil DB returns nil so
 // AxonHub's own defaults apply.
+//
+// When spec.db.addressSecret is set, the DSN is injected through an
+// env.valueFrom.secretKeyRef instead of a literal value, so credentials
+// never live in the AxonHub resource (which is readable by anyone with CR
+// read access and is often logged or audited). The API validation guarantees
+// that exactly one of address and addressSecret is set. The Secret is not
+// read by the controller (and is therefore not required to exist at reconcile
+// time); the kubelet resolves it when starting the pod, so a missing Secret
+// surfaces as a pod-level CreateContainerConfigError.
 func dbEnvForAxonHub(axonhub *axonhubv1alpha1.AxonHub) []corev1.EnvVar {
 	if axonhub.Spec.DB == nil {
 		return nil
 	}
+	dsn := corev1.EnvVar{Name: "AXONHUB_DB_DSN"}
+	if secret := axonhub.Spec.DB.AddressSecret; secret != nil {
+		dsn.ValueFrom = &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: secret.Name},
+				Key:                  secret.Key,
+			},
+		}
+	} else {
+		dsn.Value = axonhub.Spec.DB.Address
+	}
 	return []corev1.EnvVar{
 		{Name: "AXONHUB_DB_DIALECT", Value: axonhub.Spec.DB.Type},
-		{Name: "AXONHUB_DB_DSN", Value: axonhub.Spec.DB.Address},
+		dsn,
 	}
 }
 

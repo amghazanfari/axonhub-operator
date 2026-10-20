@@ -6,7 +6,15 @@ spec:
   # image intentionally omitted to demonstrate the CRD default (looplj/axonhub:latest)
   replicas: 2
   # db intentionally omitted to demonstrate the AxonHub default (SQLite);
-  # configure it to select a supported dialect and its DSN, e.g.:
+  # configure it to select a supported dialect and how to reach it, e.g.:
   # db:
   #   type: postgres
-  #   address: postgres://user:pass@postgres.default.svc:5432/axonhub?sslmode=disable
+  #   address: postgres://postgres.default.svc:5432/axonhub?sslmode=disable
+  #
+  # To keep credentials out of the custom resource, reference a Secret in
+  # the same namespace instead of using address:
+  # db:
+  #   type: postgres
+  #   addressSecret:
+  #     name: axonhub-db
+  #     key: dsn

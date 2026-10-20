@@ -49,11 +49,37 @@ spec:
                     description: |-
                       Address is the data source name (DSN) for the selected database
                       type, e.g. "file:axonhub.db?cache=shared&_fk=1" for sqlite3 or
-                      "postgres://user:pass@host:5432/axonhub?sslmode=disable" for
-                      postgres.
+                      "postgres://host:5432/axonhub?sslmode=disable" for postgres.
+                      Use AddressSecret instead when the DSN contains credentials, so they
+                      are not stored in the AxonHub resource.
                     maxLength: 2048
                     minLength: 1
                     type: string
+                  addressSecret:
+                    description: |-
+                      AddressSecret references a key in a Secret in the AxonHub resource's
+                      namespace whose value is the data source name (DSN) for the selected
+                      database type. The controller injects it through an
+                      env.valueFrom.secretKeyRef, so the credentials never live in the
+                      AxonHub resource. Mutually exclusive with Address.
+                    properties:
+                      key:
+                        description: Key is the key within the Secret whose value
+                          is the DSN.
+                        maxLength: 253
+                        minLength: 1
+                        pattern: ^[-._a-zA-Z0-9]+$
+                        type: string
+                      name:
+                        description: Name is the name of the Secret.
+                        maxLength: 253
+                        minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                        type: string
+                    required:
+                    - key
+                    - name
+                    type: object
                   type:
                     description: Type is the database dialect AxonHub should use.
                     enum:
@@ -62,9 +88,12 @@ spec:
                     - mysql
                     type: string
                 required:
-                - address
                 - type
                 type: object
+                x-kubernetes-validations:
+                - message: exactly one of address or addressSecret must be set
+                  rule: (has(self.address) && !has(self.addressSecret)) || (!has(self.address)
+                    && has(self.addressSecret))
               image:
                 default: looplj/axonhub:latest
                 description: Image is the AxonHub container image (repository[:tag]).

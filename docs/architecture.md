@@ -34,9 +34,11 @@ observe → diff → act loop:
    `controllerutil.CreateOrUpdate`:
    - The controller reference, labels, replicas, and image are always mutated.
    - The full pod template is set on **creation only** (the selector is
-     immutable); on updates only the labels and the `axonhub` container image
-     are mutated, so API-server-defaulted fields are preserved and
-     steady-state reconciles are no-ops.
+     immutable); on updates the labels and the `axonhub` container spec
+     (image, pull policy, env, ports, security context, resources) are
+     mutated, so API-server-defaulted fields are preserved and
+     steady-state reconciles are no-ops. In particular, changing `spec.db`
+     swaps `AXONHUB_DB_DSN` between a literal value and a `secretKeyRef`.
 3. **Ensure the Service** (`reconcileService`) the same way: a ClusterIP
    Service named after the CR, selecting the pods by label and routing
    port `8090` to the `http` target port. The selector is set on creation
@@ -61,7 +63,9 @@ after the CR:
     `app.kubernetes.io/managed-by=axonhub-operator`
   - a single `axonhub` container from `spec.image`, HTTP port `8090`, with
     the `AXONHUB_DB_DIALECT` / `AXONHUB_DB_DSN` environment variables set
-    when `spec.db` is configured
+    when `spec.db` is configured (`AXONHUB_DB_DSN` is a literal `value` for
+    `spec.db.address` and an `env.valueFrom.secretKeyRef` for
+    `spec.db.addressSecret`)
 - a **ClusterIP Service** selecting those pods, exposing TCP port `8090`
   (`http` → target port `http`)
 
@@ -95,9 +99,14 @@ Current spec surface:
 - `spec.replicas` (`*int32`, minimum 1, default 1)
 - `spec.image` (string, default `looplj/axonhub:latest`)
 - `spec.db` (optional `DatabaseSpec`): `type` enum (`sqlite3`, `postgres`,
-  `mysql` — the dialects AxonHub supports) and `address` (the DSN), mapped
-  to the `AXONHUB_DB_DIALECT` / `AXONHUB_DB_DSN` container environment
-  variables
+  `mysql` — the dialects AxonHub supports) plus **exactly one of** `address`
+  (a credential-free DSN) or `addressSecret` (`name`/`key` of a Secret in the
+  same namespace), mapped to the `AXONHUB_DB_DIALECT` / `AXONHUB_DB_DSN`
+  container environment variables. The CRD enforces the exactly-one rule with
+  a CEL validation. For `addressSecret` the controller sets
+  `env.valueFrom.secretKeyRef` and never reads the Secret itself (so no
+  `secrets` RBAC is required); the kubelet resolves it at pod start and
+  rotation requires a pod restart.
 
 Status surface: `observedGeneration`, `readyReplicas`, `conditions`
 (`Ready`; True reason `DeploymentReady`, False reasons include
